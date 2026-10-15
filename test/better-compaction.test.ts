@@ -11,9 +11,10 @@
  */
 /// <reference types="bun-types" />
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { buildSessionProjection, convertToLlm, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/better-compaction";
 
@@ -22,6 +23,7 @@ import extension from "../extensions/better-compaction";
 // ---------------------------------------------------------------------------
 
 interface ApiMock {
+	commands: Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>;
 	/** event → handler (in registration order) */
 	handlers: Map<string, unknown[]>;
 	/** entries appended via pi.appendEntry, in order */
@@ -34,9 +36,11 @@ interface ApiMock {
 
 function createApiMock(): ApiMock {
 	const handlers = new Map<string, unknown[]>();
+	const commands: ApiMock["commands"] = new Map();
 	const entries: Array<{ customType: string; data?: unknown }> = [];
 	return {
 		handlers,
+		commands,
 		entries,
 		on: (event, handler) => {
 			const list = handlers.get(event) ?? [];
@@ -47,7 +51,9 @@ function createApiMock(): ApiMock {
 				if (i >= 0) list.splice(i, 1);
 			};
 		},
-		registerCommand: () => {},
+		registerCommand: (name, def) => {
+			commands.set(name, def as { handler: (args: string, ctx: unknown) => Promise<void> });
+		},
 		registerEntryRenderer: () => {},
 		appendEntry: (customType, data) => {
 			entries.push({ customType, data });
@@ -55,12 +61,16 @@ function createApiMock(): ApiMock {
 	};
 }
 
-/** Fire the (single) handler registered for `event` and return its result. */
+/** Fire all handlers in registration order, retaining the last non-void result. */
 async function fire(api: ApiMock, event: string, eventPayload: unknown, ctx: unknown) {
 	const list = api.handlers.get(event);
 	expect(list, `no handler registered for ${event}`).toBeDefined();
-	const handler = list![list!.length - 1] as (e: unknown, c: unknown) => unknown;
-	return handler(eventPayload, ctx);
+	let result: unknown;
+	for (const handler of list! as Array<(e: unknown, c: unknown) => unknown>) {
+		const value = await handler(eventPayload, ctx);
+		if (value !== undefined) result = value;
+	}
+	return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +303,12 @@ function compactFailedEvent() {
 
 let tmp: string;
 let projectDir: string;
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 beforeAll(() => {
-	tmp = mkdtempSync(join(tmpdir(), "bc-test-"));
+	const root = join(tmpdir(), process.env.PI_SESSION_ID ?? `better-compaction-${process.pid}`);
+	mkdirSync(root, { recursive: true });
+	tmp = mkdtempSync(join(root, "bc-test-"));
 	// Hermetic pi agent dir (global settings): empty → all defaults.
 	process.env.PI_CODING_AGENT_DIR = join(tmp, "agent");
 	mkdirSync(process.env.PI_CODING_AGENT_DIR);
@@ -305,6 +318,8 @@ beforeAll(() => {
 
 afterAll(() => {
 	rmSync(tmp, { recursive: true, force: true });
+	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 });
 
 function freshExtension(): ApiMock {
@@ -313,7 +328,103 @@ function freshExtension(): ApiMock {
 	return api;
 }
 
+describe("single-file installation", () => {
+	test("loads an isolated copy without any repository helper files", async () => {
+		const cwd = join(tmp, "standalone");
+		mkdirSync(cwd);
+		const path = join(cwd, "better-compaction.ts");
+		copyFileSync(join(__dirname, "../extensions/better-compaction.ts"), path);
+		// Use Pi's real loader: it supplies runtime package aliases just as it
+		// does when this single file is copied to ~/.pi/agent/extensions/.
+		const agentDist = dirname(Bun.resolveSync("@earendil-works/pi-coding-agent", __dirname));
+		const { loadExtensions } = await import(pathToFileURL(join(agentDist, "core/extensions/loader.js")).href);
+		const result = await loadExtensions([path], cwd);
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toHaveLength(1);
+	});
+});
+
+describe("idle configuration commands", () => {
+	test("honors merged Pi auto-compaction settings and reports why idle compaction is blocked", async () => {
+		const cwd = join(tmp, "auto-compaction-config");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		const globalPath = join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+		const projectPath = join(cwd, ".pi", "settings.json");
+		writeFileSync(globalPath, JSON.stringify({ compaction: { enabled: false } }));
+		writeFileSync(projectPath, JSON.stringify({ betterCompaction: { idleCompaction: true } }));
+		const api = freshExtension();
+		const notices: string[] = [];
+		const ctx = {
+			...makeCtx({ sessionId: "auto-config", cwd, notify: (message) => notices.push(message), messages: [] }),
+			mode: "tui",
+		};
+		const command = api.commands.get("bc")!;
+		try {
+			await fire(api, "session_start", {}, ctx);
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("Pi auto-compaction is disabled");
+			// Project settings override global settings, and edits are read live.
+			writeFileSync(projectPath, JSON.stringify({ compaction: { enabled: true }, betterCompaction: { idleCompaction: true } }));
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("waiting for a normal model request");
+			writeFileSync(projectPath, JSON.stringify({ compaction: { enabled: false }, betterCompaction: { idleCompaction: true } }));
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("Pi auto-compaction is disabled");
+		} finally {
+			await fire(api, "session_shutdown", {}, ctx);
+			rmSync(globalPath);
+		}
+	});
+
+	test("reports opt-in idle compaction with a 50% default threshold", async () => {
+		const api = freshExtension();
+		const notices: string[] = [];
+		const ctx = makeCtx({ sessionId: "config-default", cwd: projectDir, notify: (message) => notices.push(message), messages: [] });
+		await api.commands.get("bc")!.handler("", ctx);
+		expect(notices[0]).toContain("idle: off (>=50% context, 60s before expiry)");
+	});
+
+	test("writes the boolean option to the effective project config without losing the custom threshold", async () => {
+		const cwd = join(tmp, "idle-config");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		const path = join(cwd, ".pi", "settings.json");
+		writeFileSync(path, JSON.stringify({ betterCompaction: { idleCompactionThreshold: 0.25 }, other: "preserved" }));
+		const api = freshExtension();
+		const ctx = makeCtx({ sessionId: "config-project", cwd, notify: () => {}, messages: [] });
+		const command = api.commands.get("bc")!;
+		await command.handler("idle off", ctx);
+		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ betterCompaction: { idleCompactionThreshold: 0.25, idleCompaction: false }, other: "preserved" });
+		await command.handler("idle on", ctx);
+		expect(JSON.parse(readFileSync(path, "utf8")).betterCompaction).toEqual({ idleCompactionThreshold: 0.25, idleCompaction: true });
+	});
+});
+
 describe("post-compaction report lifecycle", () => {
+	test("manual compaction still works when Pi auto-compaction is disabled", async () => {
+		const cwd = join(tmp, "manual-auto-disabled");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ compaction: { enabled: false } }));
+		const api = freshExtension();
+		const ctx = makeCtx({ sessionId: "manual-auto-disabled", cwd, notify: () => {}, messages: [] });
+		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		expect(result).toHaveProperty("compaction");
+		expect(ctx.calls).toHaveLength(1);
+	});
+
+	test("summary requests stay short even when the environment requests long caching", async () => {
+		const retention = process.env.PI_CACHE_RETENTION;
+		try {
+			process.env.PI_CACHE_RETENTION = "long";
+			const api = freshExtension();
+			const ctx = makeCtx({ sessionId: "short-summary", cwd: projectDir, notify: () => {}, messages: [] });
+			await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+			expect(ctx.calls[0]![2]).toMatchObject({ cacheRetention: "short" });
+		} finally {
+			if (retention === undefined) delete process.env.PI_CACHE_RETENTION;
+			else process.env.PI_CACHE_RETENTION = retention;
+		}
+	});
+
 	test("is NOT emitted during session_before_compact, only on session_compact", async () => {
 		const api = freshExtension();
 		const ctx = makeCtx({ sessionId: "s1", cwd: projectDir, notify: () => {}, messages: [] });
@@ -326,6 +437,7 @@ describe("post-compaction report lifecycle", () => {
 		expect(compaction.firstKeptEntryId).toBe("entry-2");
 		expect(compaction.tokensBefore).toBe(123_456);
 		expect(String(compaction.summary)).toContain("## Goal");
+		expect(ctx.calls[0]![2]).toMatchObject({ cacheRetention: "short" });
 		// …but nothing is reported yet: the compaction is not complete.
 		expect(api.entries).toEqual([]);
 
