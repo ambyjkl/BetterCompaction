@@ -54,7 +54,7 @@
  *                             // and go straight to the summary.
  *   }
  *
- * Both options can also be managed at runtime with the /bc command:
+ * Options can also be managed at runtime with the /bc command:
  *
  *   /bc                       show effective options and which settings file
  *                             provides them
@@ -63,6 +63,7 @@
  *   /bc thinking off|inherit  set the summarization thinking level
  *   /bc report on|off         show / hide the post-compaction report message
  *                             (timing and cache read)
+ *   /bc idle on|off           enable / disable idle compaction (main TUI only)
  *
  * /bc writes to the settings file that currently provides the
  * betterCompaction section (project file if it defines one, otherwise the
@@ -95,7 +96,7 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildSessionProjection,
 	CONFIG_DIR_NAME,
@@ -289,8 +290,7 @@ interface PiSettings {
 }
 
 /** The betterCompaction section of pi's settings. */
-interface BetterCompactionSettings {
-	enabled?: boolean;
+interface BetterCompactionSettings extends IdleCompactionSettings {
 	/** Show the "Compaction completed in Xs ..." message after compaction. */
 	report?: boolean;
 	/**
@@ -400,6 +400,370 @@ function applyBlockImages(messages: LlmMessage[]): LlmMessage[] {
 }
 
 // ---------------------------------------------------------------------------
+// Idle compaction (kept inline so installation requires only this file)
+// ---------------------------------------------------------------------------
+
+export interface IdleCompactionSettings {
+	enabled?: boolean;
+	idleCompaction?: boolean;
+	/** Minimum fraction of the active context window, inclusive (0–1). */
+	idleCompactionThreshold?: number;
+	idleCompactionBeforeExpirySeconds?: number;
+	/** Cache lifetime for backends without an observable TTL; overrides model metadata. */
+	idleCompactionCacheTtlSeconds?: number;
+}
+
+const IDLE_DEFAULTS = { enabled: false, threshold: 0.5, beforeExpirySeconds: 60 } as const;
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Injectable clock keeps scheduling tests deterministic, without real sleeps. */
+export interface IdleCompactionClock {
+	now(): number;
+	setTimer(callback: () => void, delayMs: number): () => void;
+}
+
+const idleClock: IdleCompactionClock = {
+	now: () => Date.now(),
+	setTimer(callback, delayMs) {
+		const timer = setTimeout(callback, delayMs);
+		timer.unref();
+		return () => clearTimeout(timer);
+	},
+};
+
+interface IdleCompactionRequest {
+	model: string;
+	startedAt: number;
+	payload: unknown;
+	responded: boolean;
+}
+
+interface IdleCompactionState {
+	ctx: ExtensionContext;
+	expectingRequest: boolean;
+	request?: IdleCompactionRequest;
+	cancelTimer?: () => void;
+	dueAt?: number;
+	blockedReason?: string;
+	needsConfiguration?: boolean;
+	lastWarning?: string;
+	promptDepth: number;
+}
+
+/** Only actual conversation breakpoints count; a cached system prompt alone is insufficient. */
+function conversationTtlMs(payload: unknown): number | null | undefined {
+	if (!isObject(payload) || !Array.isArray(payload.messages)) return;
+	const controls: unknown[] = [payload.cache_control];
+	for (const message of payload.messages) {
+		if (!isObject(message)) continue;
+		controls.push(message.cache_control);
+		if (Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (isObject(block)) {
+					controls.push(block.cache_control);
+					if (isObject(block.cachePoint) && block.cachePoint.type === "default") {
+						controls.push({ type: "ephemeral", ttl: block.cachePoint.ttl });
+					}
+				}
+			}
+		}
+	}
+	const lifetimes: number[] = [];
+	for (const control of controls) {
+		if (!isObject(control) || control.type !== "ephemeral") continue;
+		if (control.ttl === "1h") lifetimes.push(3_600_000);
+		else if (control.ttl === undefined || control.ttl === "5m") lifetimes.push(300_000);
+		else return null; // Unknown explicit lifetime: never guess a deadline.
+	}
+	return lifetimes.length > 0 ? Math.min(...lifetimes) : undefined;
+}
+
+function durationMs(value: unknown): number | undefined {
+	if (typeof value !== "string") return;
+	const match = /^(\d+)(s|m|h)$/.exec(value);
+	if (!match) return;
+	const ms = Number(match[1]) * ({ s: 1000, m: 60_000, h: 3_600_000 }[match[2]] ?? 0);
+	return Number.isSafeInteger(ms) && ms > 0 && ms <= MAX_TIMER_MS ? ms : undefined;
+}
+
+/** Wire controls take precedence; metadata/configuration supports any other backend. */
+function requestTtlMs(ctx: ExtensionContext, payload: unknown, configuredSeconds?: number): number | undefined {
+	const body = isObject(payload) ? payload : {};
+	const options = isObject(body.options) ? body.options : {};
+	const cacheOptions = isObject(body.prompt_cache_options) ? body.prompt_cache_options : {};
+	if (options.cacheRetention === "none" || cacheOptions.mode === "explicit" || body.prompt_cache_retention === "none")
+		return;
+	const conversationTtl = conversationTtlMs(payload);
+	if (conversationTtl === null) return;
+	if (conversationTtl !== undefined) return conversationTtl;
+	// Native Anthropic requests without breakpoints explicitly have caching disabled.
+	if (ctx.model?.api === "anthropic-messages" && isObject(payload)) return;
+	const wireTtl = cacheOptions.ttl ?? body.prompt_cache_retention;
+	if (wireTtl !== undefined && wireTtl !== "in_memory") return durationMs(wireTtl);
+	if (configuredSeconds !== undefined) return configuredSeconds * 1000;
+	const tier = options.cacheRetention === "long" ? "long" : "short";
+	const seconds = ctx.model?.promptCache?.[tier];
+	return seconds !== undefined && Number.isFinite(seconds) && seconds > 0 && seconds * 1000 <= MAX_TIMER_MS
+		? seconds * 1000
+		: undefined;
+}
+
+function isWarmingReplay(payload: unknown): boolean {
+	if (!isObject(payload)) return false;
+	const caps = [payload.max_tokens, payload.max_completion_tokens, payload.max_output_tokens];
+	for (const key of ["options", "config", "generationConfig", "inferenceConfig"]) {
+		const nested = payload[key];
+		if (isObject(nested)) caps.push(nested.maxTokens, nested.maxOutputTokens);
+	}
+	return caps.includes(1);
+}
+
+function modelKey(ctx: ExtensionContext): string {
+	return `${ctx.model?.provider}/${ctx.model?.id}/${ctx.model?.api}/${ctx.model?.baseUrl}/${ctx.thinkingLevel}`;
+}
+
+/**
+ * Observe ordinary provider requests without changing retention. ctx.compact()
+ * enters BetterCompaction's existing hook, whose summary request stays short.
+ * Each runtime owns its own state; print/RPC/subagents never start a timer.
+ */
+export function registerIdleCompaction(
+	pi: ExtensionAPI,
+	getSettings: (ctx: ExtensionContext) => IdleCompactionSettings,
+	time: IdleCompactionClock = idleClock,
+): { refresh(ctx: ExtensionContext): void; status(ctx: ExtensionContext): string } {
+	const states = new Map<string, IdleCompactionState>();
+	let stopObserving: (() => void) | undefined;
+	const cancel = (state: IdleCompactionState) => {
+		state.cancelTimer?.();
+		state.cancelTimer = undefined;
+		state.dueAt = undefined;
+	};
+	const reset = (ctx: ExtensionContext) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		if (!state) return;
+		cancel(state);
+		state.request = undefined;
+		state.expectingRequest = false;
+	};
+	const eligible = (state: IdleCompactionState): { expiresAt: number; dueAt: number } | undefined => {
+		const { ctx, request } = state;
+		state.blockedReason = undefined;
+		state.needsConfiguration = false;
+		const blocked = (reason: string, needsConfiguration = false) => {
+			state.blockedReason = reason;
+			state.needsConfiguration = needsConfiguration;
+			return undefined;
+		};
+		if (ctx.mode !== "tui") return blocked("main TUI sessions only");
+		if (!ctx.model) return blocked("no model selected");
+		const settings = getSettings(ctx);
+		if (settings.enabled === false || settings.idleCompaction !== true) return blocked("disabled");
+		if (!request) return blocked("waiting for a normal model request after enabling or reload");
+		if (!request.responded) return blocked("waiting for a successful model response");
+		if (request.model !== modelKey(ctx)) return blocked("model or thinking configuration changed");
+		const threshold =
+			settings.idleCompactionThreshold === undefined ? IDLE_DEFAULTS.threshold : settings.idleCompactionThreshold;
+		const margin = settings.idleCompactionBeforeExpirySeconds ?? IDLE_DEFAULTS.beforeExpirySeconds;
+		if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)
+			return blocked("idleCompactionThreshold must be a number from 0 to 1", true);
+		if (!Number.isSafeInteger(margin) || margin < 1)
+			return blocked("idleCompactionBeforeExpirySeconds must be a positive integer", true);
+		const usage = ctx.getContextUsage();
+		if (
+			!usage ||
+			usage.tokens == null ||
+			!Number.isFinite(usage.tokens) ||
+			usage.tokens < 0 ||
+			!Number.isFinite(usage.contextWindow) ||
+			usage.contextWindow <= 0
+		)
+			return blocked("context usage or window size is unknown");
+		if (usage.tokens < usage.contextWindow * threshold)
+			return blocked(`context usage ${(usage.tokens / usage.contextWindow * 100).toFixed(1)}% is below ${threshold * 100}%`);
+		const configuredTtl = settings.idleCompactionCacheTtlSeconds;
+		if (
+			configuredTtl !== undefined &&
+			(!Number.isSafeInteger(configuredTtl) || configuredTtl < 1 || configuredTtl * 1000 > MAX_TIMER_MS)
+		)
+			return blocked("idleCompactionCacheTtlSeconds must be a positive integer within the timer limit", true);
+		const ttl = requestTtlMs(ctx, request.payload, configuredTtl);
+		if (ttl === undefined)
+			return blocked("no usable cache TTL; if metadata is missing, configure betterCompaction.idleCompactionCacheTtlSeconds", true);
+		if (margin * 1000 >= ttl) return blocked("expiry margin must be smaller than the cache TTL", true);
+		const expiresAt = request.startedAt + ttl;
+		if (time.now() >= expiresAt) return blocked("observed cache lifetime already elapsed; waiting for a new request");
+		return { expiresAt, dueAt: expiresAt - margin * 1000 };
+	};
+	const schedule = (state: IdleCompactionState) => {
+		cancel(state);
+		const deadline = eligible(state);
+		if (!deadline) {
+			if (state.needsConfiguration && state.blockedReason !== state.lastWarning) {
+				state.lastWarning = state.blockedReason;
+				state.ctx.ui.notify(`Better Compaction: idle compaction not armed: ${state.blockedReason}`, "warning");
+			}
+			return;
+		}
+		state.lastWarning = undefined;
+		if (state.promptDepth > 0) return;
+		state.dueAt = deadline.dueAt;
+		const request = state.request;
+		state.cancelTimer = time.setTimer(
+			() => {
+				state.cancelTimer = undefined;
+				state.dueAt = undefined;
+				// Recheck everything synchronously: compact() aborts active work rather
+				// than queueing behind it. No await may separate this check from the call.
+				if (state.request !== request || !state.ctx.isIdle() || state.ctx.hasPendingMessages()) return;
+				const current = eligible(state);
+				if (!current || state.promptDepth > 0 || state.ctx.ui.getEditorText().trim()) return;
+				if (time.now() < current.dueAt) {
+					schedule(state); // Settings or the observed payload changed the deadline.
+					return;
+				}
+				state.request = undefined; // At most one attempt per ordinary request, even on failure.
+				const onError = (error: Error) =>
+					state.ctx.ui.notify(`Better Compaction: idle compaction failed: ${error.message}`, "error");
+				try {
+					state.ctx.compact({ onError });
+				} catch (error) {
+					onError(error instanceof Error ? error : new Error(String(error)));
+				}
+			},
+			Math.max(0, deadline.dueAt - time.now()),
+		);
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		if (ctx.mode !== "tui") return;
+		const id = ctx.sessionManager.getSessionId();
+		const old = states.get(id);
+		if (old) cancel(old);
+		states.set(id, { ctx, expectingRequest: false, promptDepth: 0 });
+		// No restored request timestamp: wait for a real request in this runtime.
+	});
+	pi.on("agent_start", (_event, ctx) => reset(ctx));
+	pi.on("context", (_event, ctx) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		if (!state) return;
+		reset(ctx);
+		state.ctx = ctx;
+		const settings = getSettings(ctx);
+		if (!ctx.model || settings.enabled === false || settings.idleCompaction !== true) return;
+		state.expectingRequest = true;
+		// Custom/local providers need not invoke HTTP payload/response hooks.
+		// Their normal context + successful message still supplies a safe clock.
+		state.request = { model: modelKey(ctx), startedAt: time.now(), payload: undefined, responded: false };
+		// Install the observer at request time, after all extension factories have
+		// registered their payload transforms. This observes replacement payloads
+		// too, regardless of package load order. Never keep stacking observers.
+		stopObserving?.();
+		stopObserving = pi.on("before_provider_request", (event, requestCtx) => {
+			const current = states.get(requestCtx.sessionManager.getSessionId());
+			if (!current?.expectingRequest) return;
+			// A warming replay can race with preparation of the next real request.
+			// Pi warms with a one-token output budget; never let it consume the slot.
+			if (isWarmingReplay(event.payload)) return;
+			current.expectingRequest = false;
+			current.request = {
+				model: modelKey(requestCtx),
+				startedAt: time.now(),
+				payload: event.payload,
+				responded: false,
+			};
+			// Do not return a value: that would replace the provider payload.
+		});
+		// Warming replays skip context transformation. Only consume one payload
+		// per real context event, so warming cannot masquerade as new progress.
+	});
+	pi.on("after_provider_response", (event, ctx) => {
+		const request = states.get(ctx.sessionManager.getSessionId())?.request;
+		if (request && event.status >= 200 && event.status < 300) request.responded = true;
+	});
+	pi.on("message_end", (event, ctx) => {
+		const request = states.get(ctx.sessionManager.getSessionId())?.request;
+		const message = event.message;
+		if (request && message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			request.responded = true;
+		}
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		if (state) {
+			state.ctx = ctx;
+			schedule(state); // The timer runs outside this notification-only event.
+		}
+	});
+	pi.on("cache_warming_decision", (_event, ctx) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		// Prefer the pending idle compaction to paying for an idle refresh. Leave
+		// warming during active work and in ineligible sessions unchanged.
+		if (
+			state?.cancelTimer &&
+			ctx.isIdle() &&
+			!ctx.hasPendingMessages() &&
+			eligible(state) &&
+			state.promptDepth === 0 &&
+			!ctx.ui.getEditorText().trim()
+		) {
+			return { action: "stop" };
+		}
+	});
+	pi.on("input", (_event, ctx) => reset(ctx));
+	pi.on("model_select", (_event, ctx) => reset(ctx));
+	pi.on("thinking_level_select", (_event, ctx) => reset(ctx));
+	pi.on("session_before_tree", (_event, ctx) => reset(ctx));
+	pi.on("session_tree", (_event, ctx) => reset(ctx));
+	pi.on("session_before_switch", (_event, ctx) => reset(ctx));
+	pi.on("session_before_compact", (_event, ctx) => reset(ctx));
+	pi.on("session_compact", (_event, ctx) => reset(ctx));
+	pi.on("session_compact_failed", (_event, ctx) => reset(ctx));
+	pi.on("ui_prompt_start", (_event, ctx) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		if (state) {
+			state.promptDepth++;
+			cancel(state);
+		}
+	});
+	pi.on("ui_prompt_end", (_event, ctx) => {
+		const state = states.get(ctx.sessionManager.getSessionId());
+		if (state) {
+			state.promptDepth = Math.max(0, state.promptDepth - 1);
+			if (ctx.isIdle()) schedule(state);
+		}
+	});
+	pi.on("session_shutdown", (_event, ctx) => {
+		const id = ctx.sessionManager.getSessionId();
+		const state = states.get(id);
+		if (state) cancel(state);
+		states.delete(id);
+		if (states.size === 0) {
+			stopObserving?.();
+			stopObserving = undefined;
+		}
+	});
+
+	return {
+		status(ctx) {
+			const settings = getSettings(ctx);
+			if (settings.enabled === false || settings.idleCompaction !== true) return "disabled";
+			const state = states.get(ctx.sessionManager.getSessionId());
+			if (!state) return "not armed: no active main-TUI session tracking";
+			if (!eligible(state)) return `not armed: ${state.blockedReason}`;
+			if (state.promptDepth > 0) return "not armed: waiting for UI prompt to close";
+			return state.cancelTimer && state.dueAt !== undefined
+				? `armed for ${new Date(state.dueAt).toISOString()}`
+				: "not armed: timer was skipped or has not been scheduled; /bc idle on rechecks eligibility";
+		},
+		refresh(ctx) {
+			const state = states.get(ctx.sessionManager.getSessionId());
+			if (state && ctx.isIdle()) schedule(state);
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -448,6 +812,8 @@ function formatCompactionReport(report: CompactionReportData): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	const idleCompaction = registerIdleCompaction(pi, (ctx) => loadPiSettings(ctx.cwd).settings.betterCompaction ?? {});
+
 	// Reports stashed by the session_before_compact handler, emitted on
 	// session_compact (see below). Cleared on session_compact_failed.
 	const pendingReports = new Map<string, CompactionReport>();
@@ -479,9 +845,9 @@ export default function (pi: ExtensionAPI) {
 	// /bc — inspect and control this extension's options.
 	pi.registerCommand("bc", {
 		description:
-			"Better Compaction: /bc [on|off|thinking off|inherit|report on|off] — show or change compaction options",
+			"Better Compaction: /bc [on|off|thinking off|inherit|report on|off|idle on|off] — show or change compaction options",
 		getArgumentCompletions: (prefix) => {
-			const options = ["on", "off", "thinking", "report"];
+			const options = ["on", "off", "thinking", "report", "idle"];
 			const filtered = options.filter((o) => o.startsWith(prefix.toLowerCase()));
 			return filtered.length > 0
 				? filtered.map((o) => ({ value: o, label: o, description: "Better Compaction option" }))
@@ -499,16 +865,29 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(
 					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} | ` +
 						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
+						`idle: ${section.idleCompaction === true ? "on" : "off"} ` +
+						`(>=${(section.idleCompactionThreshold ?? IDLE_DEFAULTS.threshold) * 100}% context, ` +
+						`${section.idleCompactionBeforeExpirySeconds ?? IDLE_DEFAULTS.beforeExpirySeconds}s before expiry) | ` +
+						`cache TTL: ${section.idleCompactionCacheTtlSeconds === undefined ? "auto" : `${section.idleCompactionCacheTtlSeconds}s fallback`} | ` +
+						`idle timer: ${idleCompaction.status(ctx)} | ` +
 						`config: ${betterCompactionSource} (${betterCompactionSourcePath})`,
 				);
 				return;
 			}
 			if (arg === "on" || arg === "off") {
 				const path = writeBetterCompactionSetting(ctx.cwd, { enabled: arg === "on" });
+				idleCompaction.refresh(ctx);
 				ctx.ui.notify(
 					`Better Compaction ${arg === "on" ? "enabled" : "disabled"} (written to ${path}; ` +
 						`applies at the next compaction)`,
 				);
+				return;
+			}
+			if (arg === "idle on" || arg === "idle off") {
+				const enabled = arg === "idle on";
+				const path = writeBetterCompactionSetting(ctx.cwd, { idleCompaction: enabled });
+				idleCompaction.refresh(ctx);
+				ctx.ui.notify(`Better Compaction: idle compaction ${enabled ? "enabled" : "disabled"} (written to ${path}); idle timer: ${idleCompaction.status(ctx)}`);
 				return;
 			}
 			if (arg.startsWith("thinking")) {
@@ -538,7 +917,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				"Better Compaction: usage: /bc [on|off|thinking off|inherit|report on|off]",
+				"Better Compaction: usage: /bc [on|off|thinking off|inherit|report on|off|idle on|off]",
 				"error",
 			);
 		},

@@ -96,6 +96,7 @@ pi update --extensions   # reconcile to the pinned ref later
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
 | `/bc thinking off\|inherit` | Set the summarization thinking level |
 | `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
+| `/bc idle on\|off` | Enable / disable idle compaction |
 
 `/bc` writes to the settings file that **currently provides** the
 `betterCompaction` section — the project file (`.pi/settings.json`) if it
@@ -112,7 +113,10 @@ compaction time, so they apply at the **next compaction** without restarting.
   "betterCompaction": {
     "enabled": true,
     "report": true,
-    "thinking": "inherit"
+    "thinking": "inherit",
+    "idleCompaction": false,
+    "idleCompactionThreshold": 0.5,
+    "idleCompactionBeforeExpirySeconds": 60
   }
 }
 ```
@@ -122,6 +126,98 @@ compaction time, so they apply at the **next compaction** without restarting.
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
 | `report` | `true` | `false` → don't append the "Compaction completed in Xs ..." message to the chat after a compaction (toggle with `/bc report off`) |
 | `thinking` | `"inherit"` | Thinking level for the summarization call: `"inherit"` (the model keeps thinking, but the prompt asks it to keep thinking brief), `"off"` (the prompt asks it to skip thinking entirely and go straight to the summary). In both cases the request itself always runs at the session's own thinking level — see below |
+
+### Idle compaction
+
+Idle compaction is **opt-in** and supports **any provider** in main interactive
+TUI sessions. Enable it with `/bc idle on` or `"idleCompaction": true` under
+`betterCompaction`. Once usage reaches **50% of the active model's context
+window**, it schedules a compaction 60 seconds before the estimated conversation
+cache expires.
+The model then continues from the summary plus retained recent messages, **not
+its full original context**. Original session entries remain stored on disk.
+
+Configure it under `betterCompaction` in Pi's global or project `settings.json`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `idleCompaction` | `false` | Explicitly set to `true` to opt in, or use `/bc idle on` |
+| `idleCompactionThreshold` | `0.5` | Minimum fraction of the active context window; number from `0` to `1`, inclusive (`0.5` = 50%) |
+| `idleCompactionBeforeExpirySeconds` | `60` | Start this many seconds before cache expiry; positive integer smaller than the estimated cache lifetime |
+| `idleCompactionCacheTtlSeconds` | Unset | Cache lifetime for opaque/custom/local backends; overrides model metadata but not explicit wire controls or cache disablement |
+
+There is **no environment variable**. `/bc` shows the effective values and the
+actual idle timer state: an armed UTC deadline or the reason no timer is armed.
+`idle: on` means the feature is enabled, **not** that a timer exists. Missing TTL
+metadata or invalid scheduling options produce a one-time warning rather than
+silently doing nothing. Settings are checked when scheduling and again before execution. `/bc idle on|off`
+updates a pending timer immediately; other settings edits apply at the next
+scheduling boundary or timer check. Disabling Better Compaction with `/bc off`
+also disables idle compaction. Invalid numeric options prevent scheduling.
+The threshold is recalculated from the current context window at scheduling and
+execution: `0` accepts any known usage, and `1` requires a full window. Unknown
+or invalid context-window sizes prevent scheduling. This replaces the previous
+`idleCompactionMinTokens` setting; that token-count setting is no longer used.
+Cache lifetimes must fit within Node's timer limit (about 24.8 days).
+
+Cache lifetime is resolved in this order:
+
+1. **Wire controls:** Anthropic-compatible conversation breakpoints, Bedrock
+   cache points, and OpenAI `prompt_cache_retention` / `prompt_cache_options.ttl`.
+   Mixed conversation breakpoints use the shortest observed lifetime. Native
+   Anthropic requests without conversation breakpoints are not eligible.
+2. **Configured lifetime:** `idleCompactionCacheTtlSeconds` supports any backend,
+   including custom/local providers with no cache metadata.
+3. **Model metadata:** Pi's `model.promptCache.short`, or `.long` when the payload
+   explicitly selects long retention. Metadata is a best-effort estimate.
+
+Unknown lifetimes and explicitly disabled caching are skipped rather than
+inventing a deadline. There is **no automatic 30-minute fallback**. Some Codex
+catalog entries lack `promptCache` metadata; configure
+`idleCompactionCacheTtlSeconds: 1800` explicitly if a 30-minute scheduling lifetime
+is appropriate for that backend. A new normal request after enabling/reloading
+is required; a cache deadline that already elapsed is not used retroactively.
+For example, an opaque local backend can use:
+
+```json
+{
+  "betterCompaction": {
+    "idleCompaction": true,
+    "idleCompactionCacheTtlSeconds": 3600
+  }
+}
+```
+
+The clock starts at request time, not after generation finishes. For custom
+providers that do not expose HTTP hooks, the normal context event supplies the
+clock and a successful assistant message confirms completion. Requests from
+cache warming do not count as new conversation progress. No cache timestamp is
+inferred from resumed sessions; a normal request must run first after opting in.
+
+Idle compaction runs through the same Better Compaction summarizer as manual
+and threshold compaction. **Summarization requests always use
+`cacheRetention: "short"`**, including when normal requests use long retention.
+This extension never modifies `PI_CACHE_RETENTION`, normal-request retention, or
+subagent caching. Long retention for the main agent belongs in a separate
+extension. The request observer is installed at each context boundary, after
+extensions have registered their payload transformations, so ordinary transforms
+work regardless of package load order, including ones that replace the payload.
+
+Timers run only after the agent fully settles. They are invalidated on new
+input/work, model/thinking/branch/session changes, and other compactions, and cleaned up
+on shutdown/reload. Execution rechecks idleness, queued messages, context size,
+UI prompts, and unsent editor text. Expired-cache timers after sleep are skipped.
+An unchanged request is attempted at most once, even if compaction fails.
+Print/JSON/RPC sessions, including `pi-subagents-lite` children, do not schedule
+idle compaction; their ordinary compaction behavior is unchanged.
+
+When an eligible idle compaction is pending, it takes precedence over Pi's idle
+cache warming. Warming during active work and in ineligible sessions is left
+alone. Other extensions can override the warming decision later in load order.
+Cache TTLs are best-effort: a requested lifetime is not proof that the provider
+cached the prefix. Extensions that dynamically register a new payload transform
+after this extension's context handler can still hide the final TTL from the
+observer. No savings are guaranteed.
 
 ### How thinking is handled (and why the thinking mode is never changed)
 
