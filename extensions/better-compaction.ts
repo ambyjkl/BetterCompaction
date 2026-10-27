@@ -41,17 +41,19 @@
  *                        // compaction without restarting.
  *     "report": true,    // false → don't append the "Compaction completed
  *                        // in Xs ..." message to the chat after a compaction
+ *     "summaryMaxTokens": 8192, // Completion budget, independent of the
+ *                              // compaction trigger's reserveTokens. The
+ *                              // prompt targets half this budget for text.
  *     "thinking": "inherit",  // "inherit" (default) | "off". The summarization
- *                             // call always runs at the session's own thinking
- *                             // level — we never change the thinking mode in
- *                             // the request, because with some models the
- *                             // thinking mode is applied at the chat-template
- *                             // level and switching it forces a full prefill
- *                             // of the conversation. Instead, thinking is
- *                             // steered in the appended compaction prompt:
- *                             // "inherit" asks the model to keep thinking
- *                             // brief, "off" asks it to skip thinking entirely
- *                             // and go straight to the summary.
+ *                             // request keeps the session's top-level thinking
+ *                             // setting to preserve the cached prefix. "off"
+ *                             // appends a configuration_update on OpenAI GPT-6
+ *                             // Responses/Codex models, selecting "none" or
+ *                             // the lowest effort supported by model metadata.
+ *                             // Supported native Anthropic models receive a
+ *                             // per-message effort update to "low" instead.
+ *                             // Other backends use prompt-only steering.
+ *                             // "inherit" asks the model to keep thinking brief.
  *   }
  *
  * Both options can also be managed at runtime with the /bc command:
@@ -68,9 +70,9 @@
  * betterCompaction section (project file if it defines one, otherwise the
  * global file), so it always edits the file that is in effect.
  *
- * When compaction runs without thinking, a warning is shown once per session
- * (some models summarize significantly worse — or not at all — without
- * thinking). After each successful compaction, a persistent message is
+ * A warning is shown once per session for no-thinking compaction, including
+ * when "off" can only be requested through prompt steering rather than an API
+ * control. After each successful compaction, a persistent message is
  * appended to the chat reporting total time, the thinking vs generation
  * split, and how many tokens were served from the prefix cache. It is a
  * custom session entry (pi.appendEntry) rendered by an entry renderer: it
@@ -95,19 +97,25 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildSessionProjection,
 	CONFIG_DIR_NAME,
 	convertToLlm,
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { contentText, normalizeContext, retryAssistantCall } from "@earendil-works/pi-ai";
+import type { AssistantMessage, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel,
+	contentText,
+	getCurrentSystemMessage,
+	normalizeContext,
+	retryAssistantCall,
+} from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
-// Prompts (verbatim from pi's built-in compaction, compaction.ts / utils.ts)
+// Structured prompts, adapted from pi's built-in compaction
 // ---------------------------------------------------------------------------
 
 /**
@@ -115,6 +123,8 @@ import { Text } from "@earendil-works/pi-tui";
  * prompt. Here it becomes part of the appended user message at the end of
  * the conversation.
  */
+const DEFAULT_SUMMARY_MAX_TOKENS = 8192;
+
 const SUMMARY_ROLE = `
 <system>
 THIS IS NOT A USER MESSAGE: IGNORE WHATEVER YOU WERE DOING YOUR TASK HAS NOW CHANGED. YOU'RE NOT A CODING AGENT ANYMORE, YOU'RE NOW A COMPACTING AGENT.
@@ -167,44 +177,21 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+const UPDATE_SUMMARIZATION_PROMPT = `An earlier compaction checkpoint is already provided above. Rewrite it using the subsequent messages to produce ONE fresh, self-contained checkpoint of the current state, not an append-only changelog.
 
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+- Preserve the current goal, binding constraints, active work, unresolved blockers, and decisions needed to continue correctly.
+- Replace superseded facts and next steps. Remove obsolete or repeated material rather than carrying every old item forward.
+- Consolidate completed work into a few outcome-focused bullets. Do not reproduce the historical experiment, benchmark, or commit-by-commit log.
+- Preserve exact paths, identifiers, and error messages only where they are needed for the next steps; point to existing files for detailed evidence.
+- An oversized previous checkpoint must be condensed, not used as a minimum length.
 
-Use this EXACT format:
+`;
 
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+function summarySizeInstruction(targetTokens: number): string {
+	return `\n\nSummary size budget: aim for at most ${targetTokens} tokens of summary text, including every section. Finish the complete checkpoint within the available output budget.
+Prioritize actionable state over historical detail. Keep the Done section to a few consolidated outcomes; do not enumerate every past experiment or generated artifact. Use short bullets, avoid repeated facts across sections, and reference on-disk documents instead of copying their contents.
+Do not generate <read-files> or <modified-files> lists: the extension appends file-operation tracking automatically. Mention only the files needed to resume the work in the narrative.`;
+}
 
 /**
  * Appended to every compaction prompt (the default "inherit" mode). The
@@ -219,12 +206,10 @@ Keep your internal thinking short and direct: this is a brief, structured summar
 
 /**
  * Appended when the compaction's thinking is "off". We do NOT turn thinking
- * off in the request: with some models the thinking mode is applied at the
- * chat-template level (the template injects different prompts into the running
- * chat), so switching it changes the prompt structure and forces a full
- * prefill of the whole conversation. Instead we keep the request identical to
- * the agent's last request and tell the model, in the prompt, to skip thinking
- * and write the summary straight away.
+ * off at the top level: changing it can rewrite the rendered prefix, including
+ * OpenAI's hidden instructions, and lose the cache. Supported OpenAI/Anthropic
+ * models also receive an append-only effort update; other models have only
+ * this best-effort prompt instruction.
  */
 const NO_THINKING_INSTRUCTION = `
 
@@ -293,19 +278,124 @@ interface BetterCompactionSettings {
 	enabled?: boolean;
 	/** Show the "Compaction completed in Xs ..." message after compaction. */
 	report?: boolean;
+	/** Completion budget (default 8192, minimum 1024); the prompt targets half for text. */
+	summaryMaxTokens?: number;
 	/**
-	 * Thinking level for the summarization call. "inherit" (default) runs at
-	 * the session's own thinking level and steers the model to keep thinking
-	 * brief; "off" steers it to skip thinking entirely and go straight to the
-	 * summary. In both cases the request keeps the session's thinking mode
-	 * (changing it would force a full prefill); thinking is steered in the
-	 * appended prompt, not in the request.
+	 * "inherit" (default) keeps the session's thinking level and asks for brief
+	 * thinking. "off" appends an OpenAI GPT-6 configuration_update selecting
+	 * none/the lowest supported effort, or an Anthropic per-message effort
+	 * update to low. Other backends use prompt-only steering. The top-level
+	 * thinking setting is never changed.
 	 */
 	thinking?: "off" | "inherit";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+type CompactionReasoningUpdate = { kind: "openai" | "anthropic"; effort: string };
+const ANTHROPIC_EFFORT_BETA = "mid-conversation-output-config-2026-07-01";
+
+/** Only verified native APIs/models receive append-only effort updates. */
+function compactionReasoningUpdate(
+	model: ExtensionContext["model"],
+	thinking: "off" | "inherit",
+	sessionThinking: ExtensionContext["thinkingLevel"],
+): CompactionReasoningUpdate | undefined {
+	if (thinking !== "off" || !model?.reasoning) return;
+	if (
+		model.api === "anthropic-messages" && model.provider === "anthropic" &&
+		model.compat && "supportsMidConvoEffort" in model.compat && model.compat.supportsMidConvoEffort === true
+	) {
+		// Effort cannot change mid-conversation with thinking disabled. Do not
+		// turn adaptive thinking on just to lower effort: that breaks caching.
+		if ((!sessionThinking || sessionThinking === "off") && model.thinkingLevelMap?.off !== null) return;
+		return { kind: "anthropic", effort: "low" };
+	}
+	if (
+		(model.provider !== "openai" && model.provider !== "openai-codex") ||
+		(model.api !== "openai-responses" && model.api !== "openai-codex-responses") ||
+		!/^gpt-6(?:[.-]|$)/.test(model.id)
+	) return;
+	// Some models do not support none/minimal. Honor Pi's model metadata rather
+	// than sending an unsupported effort or changing the top-level setting.
+	const level = clampThinkingLevel(model, "off");
+	return { kind: "openai", effort: model.thinkingLevelMap?.[level] ?? (level === "off" ? "none" : level) };
+}
+
+function describeReasoningUpdate(update: CompactionReasoningUpdate): string {
+	return `${update.kind === "openai" ? "configuration_update" : "per-message effort"}: ${update.effort}`;
+}
+
+/** Preserve every existing input item; insert the update just before our final user prompt. */
+function withCompactionReasoningUpdate(payload: unknown, effort: string): unknown {
+	if (!isObject(payload) || !Array.isArray(payload.input) || payload.input.length === 0) {
+		throw new Error("Better Compaction: expected a Responses input array for the reasoning update");
+	}
+	const input = payload.input;
+	const prompt = input[input.length - 1];
+	if (!isObject(prompt) || prompt.role !== "user") {
+		throw new Error("Better Compaction: expected the summary prompt to be the final Responses user message");
+	}
+	const previous = input[input.length - 2];
+	if (isObject(previous) && previous.type === "configuration_update") {
+		// Be idempotent if instrumentation/retries reuse an already transformed
+		// payload. OpenAI rejects adjacent configuration_update items.
+		if (isObject(previous.reasoning) && previous.reasoning.effort === effort) return payload;
+		throw new Error("Better Compaction: cannot append adjacent reasoning configuration updates");
+	}
+	return {
+		...payload,
+		input: [
+			...input.slice(0, -1),
+			{ type: "configuration_update", reasoning: { effort } },
+			prompt,
+		],
+	};
+}
+
+/** Change only the effort marker for the final summary turn, never historical markers. */
+function withAnthropicCompactionEffort(payload: unknown, effort: string): unknown {
+	if (!isObject(payload) || !Array.isArray(payload.messages) || payload.messages.length === 0) {
+		throw new Error("Better Compaction: expected an Anthropic messages array for the effort update");
+	}
+	if (!isObject(payload.thinking) || payload.thinking.type !== "adaptive") {
+		throw new Error("Better Compaction: expected adaptive Anthropic thinking for the effort update");
+	}
+	// Pi adds this beta for supportsMidConvoEffort models. Do not silently
+	// enable an unobserved API mode or send an update the endpoint will reject.
+	if (!Array.isArray(payload.betas) || !payload.betas.includes(ANTHROPIC_EFFORT_BETA)) {
+		throw new Error("Better Compaction: expected the Anthropic per-message effort beta");
+	}
+	const messages = payload.messages;
+	const last = messages[messages.length - 1];
+	if (
+		!isObject(last) || last.role !== "system" ||
+		!Array.isArray(last.content) || last.content.length !== 0 ||
+		!Object.keys(last).every((key) => key === "role" || key === "content" || key === "output_config") ||
+		!isObject(last.output_config) || Object.keys(last.output_config).length !== 1 ||
+		typeof last.output_config.effort !== "string" ||
+		!["low", "medium", "high", "xhigh", "max"].includes(last.output_config.effort)
+	) {
+		throw new Error("Better Compaction: expected Pi's final Anthropic effort-only system message");
+	}
+	const prompt = messages[messages.length - 2];
+	if (
+		!isObject(prompt) || prompt.role !== "user" ||
+		!(typeof prompt.content === "string" ? prompt.content.trim().length > 0 :
+			Array.isArray(prompt.content) && prompt.content.some((block) =>
+				isObject(block) && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0))
+	) {
+		throw new Error("Better Compaction: expected the summary prompt to be the final Anthropic user turn");
+	}
+	// Pi normally appends the active effort AFTER the final user message.
+	// Inserting low before that message would be undone by Pi's trailing marker.
+	if (last.output_config.effort === effort) return payload;
+	return {
+		...payload,
+		messages: [...messages.slice(0, -1), { ...last, output_config: { ...last.output_config, effort } }],
+	};
 }
 
 /** Same deep-merge semantics as pi's SettingsManager (override wins). */
@@ -452,6 +542,17 @@ export default function (pi: ExtensionAPI) {
 	// session_compact (see below). Cleared on session_compact_failed.
 	const pendingReports = new Map<string, CompactionReport>();
 
+	// Pi applies before_agent_start prompt overrides only to outgoing requests,
+	// not the stored transcript. Retain the shared options object: handlers
+	// registered after ours can still set forceSystemPrompt on that same object.
+	const promptOptions = new Map<string, { forceSystemPrompt?: string }>();
+	pi.on("before_agent_start", (event, ctx) => {
+		promptOptions.set(ctx.sessionManager.getSessionId(), event.systemPromptOptions);
+	});
+	pi.on("session_shutdown", (_event, ctx) => {
+		promptOptions.delete(ctx.sessionManager.getSessionId());
+	});
+
 	// Render the persisted post-compaction report in the chat. Custom entries
 	// never participate in LLM context, so the report stays visible in the
 	// transcript without being sent to the model.
@@ -463,14 +564,20 @@ export default function (pi: ExtensionAPI) {
 
 	// Warn once per session when compaction will run without thinking.
 	pi.on("session_start", (_event, ctx) => {
+		promptOptions.delete(ctx.sessionManager.getSessionId());
 		const { settings } = loadPiSettings(ctx.cwd);
 		if (settings.betterCompaction?.enabled === false) return;
 		const thinking = settings.betterCompaction?.thinking ?? "inherit";
 		const noThinking =
 			thinking === "off" || (thinking === "inherit" && (!ctx.thinkingLevel || ctx.thinkingLevel === "off"));
 		if (noThinking && ctx.hasUI) {
+			const update = compactionReasoningUpdate(ctx.model, thinking, ctx.thinkingLevel);
 			ctx.ui.notify(
-				"Better Compaction: compaction will run with thinking turned off — some models summarize significantly worse (or not at all) without it",
+				thinking === "off"
+					? update !== undefined
+						? `Better Compaction: compaction will request ${describeReasoningUpdate(update)} via an append-only update; top-level session thinking stays unchanged`
+						: "Better Compaction: thinking off uses prompt-only steering on this model; API thinking stays unchanged and the model may still think"
+					: "Better Compaction: session thinking is off — some models summarize significantly worse (or not at all) without it",
 				"warning",
 			);
 		}
@@ -493,11 +600,17 @@ export default function (pi: ExtensionAPI) {
 			const enabled = section.enabled !== false;
 			const report = section.report !== false;
 			const thinking = section.thinking ?? "inherit";
+			const thinkingMechanism = (choice: "off" | "inherit") => {
+				if (choice === "inherit") return "session level; brief-thinking prompt";
+				const update = compactionReasoningUpdate(ctx.model, choice, ctx.thinkingLevel);
+				return update !== undefined ? describeReasoningUpdate(update) : "prompt only; API thinking unchanged";
+			};
 			const arg = args.trim().toLowerCase();
 
 			if (arg === "") {
 				ctx.ui.notify(
-					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} | ` +
+					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} (${thinkingMechanism(thinking)}) | ` +
+						`summary budget: ${section.summaryMaxTokens ?? DEFAULT_SUMMARY_MAX_TOKENS} tokens | ` +
 						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
 						`config: ${betterCompactionSource} (${betterCompactionSourcePath})`,
 				);
@@ -519,7 +632,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const path = writeBetterCompactionSetting(ctx.cwd, { thinking: value });
 				ctx.ui.notify(
-					`Better Compaction: compaction thinking set to ${value} (written to ${path}; ` +
+					`Better Compaction: compaction thinking set to ${value} (${thinkingMechanism(value)}; written to ${path}; ` +
 						`applies at the next compaction)`,
 				);
 				return;
@@ -554,11 +667,10 @@ export default function (pi: ExtensionAPI) {
 		const { settings } = loadPiSettings(ctx.cwd);
 		if (settings.betterCompaction?.enabled === false) return;
 
-		// "inherit" (default) steers the model to keep thinking brief; "off"
-		// steers it to skip thinking entirely. In both cases the request keeps
-		// the session's thinking mode (see the reasoning block below), so the
-		// prompt cache is preserved.
+		// Keep top-level effort unchanged for cache reuse. "off" also appends a
+		// native effort update where supported, otherwise it is prompt-only.
 		const thinkingChoice = settings.betterCompaction?.thinking ?? "inherit";
+		const reasoningUpdate = compactionReasoningUpdate(model, thinkingChoice, ctx.thinkingLevel);
 
 		// 1. Rebuild the prefix of pi's LLM request up to the compaction cut.
 		//
@@ -585,6 +697,33 @@ export default function (pi: ExtensionAPI) {
 		const prefixMessages = projection.entries.slice(0, cutIndex).flatMap((e) => e.messages);
 		let llmMessages = convertToLlm(prefixMessages);
 
+		// Mirror Pi's request-only forced-prompt projection (e.g. smart-timeout).
+		// It collapses ALL system deltas and the CURRENT tool set into one head,
+		// then removes later system messages. Keeping the raw historical head
+		// instead changes both instructions and the first serialized tool item.
+		const observedOptions = promptOptions.get(ctx.sessionManager.getSessionId());
+		const forcedPrompt = observedOptions?.forceSystemPrompt;
+		// Do not infer force mode from ctx.getSystemPrompt(): after settlement
+		// Pi resets that getter to the base prompt, losing the request override.
+		if (observedOptions === undefined && ctx.hasUI) {
+			ctx.ui.notify(
+				"Better Compaction: no normal run observed since loading/switching sessions; request-only prompt overrides are unknown. Send a normal message before compacting to preserve their cached header.",
+				"warning",
+			);
+		}
+		if (forcedPrompt !== undefined) {
+			const currentSystem = getCurrentSystemMessage(convertToLlm(projection.messages));
+			llmMessages = [
+				{
+					role: "system",
+					content: forcedPrompt,
+					...(currentSystem?.toolsAdded ? { toolsAdded: currentSystem.toolsAdded } : {}),
+					timestamp: currentSystem?.timestamp ?? 0,
+				},
+				...llmMessages.filter((message) => message.role !== "system"),
+			];
+		}
+
 		// pi's agent filters images out of every request when images.blockImages
 		// is enabled (replacing them with a placeholder). Mirror that so the
 		// rebuilt prefix matches what the agent actually sent to the LLM.
@@ -607,19 +746,52 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (llmMessages.length === 0) return; // nothing to compact — let pi decide
 
-		// 2. The compaction prompt: pi's summarization system prompt, now
-		//    appended at the end of the conversation as a single user message.
+		// reserveTokens controls WHEN Pi compacts, not how large the checkpoint
+		// should become. A large context-window reserve must not produce a huge
+		// summary. Pi's adapters still handle the unchanged thinking allowance.
+		const configuredSummaryMaxTokens = settings.betterCompaction?.summaryMaxTokens;
+		const summaryMaxTokens = configuredSummaryMaxTokens === undefined
+			? DEFAULT_SUMMARY_MAX_TOKENS : configuredSummaryMaxTokens;
+		if (!Number.isSafeInteger(summaryMaxTokens) || summaryMaxTokens < 1024) {
+			throw new Error("Better Compaction: summaryMaxTokens must be a safe integer of at least 1024");
+		}
+		const modelOutputLimit = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;
+		const requestedLimit = Math.min(summaryMaxTokens, modelOutputLimit);
+		const adaptiveAnthropic = model.api === "anthropic-messages" && model.compat &&
+			(("forceAdaptiveThinking" in model.compat && model.compat.forceAdaptiveThinking === true) ||
+				("supportsMidConvoEffort" in model.compat && model.compat.supportsMidConvoEffort === true));
+		// Budget-based adapters can render a different thinking budget when the
+		// output ceiling shrinks. Leave their existing request ceiling unchanged;
+		// enforce the text target through the appended prompt instead. Codex also
+		// uses the prompt target: its adapter sends no wire output-token limit.
+		const canLimitOutput = !model.reasoning || !ctx.thinkingLevel || ctx.thinkingLevel === "off" ||
+			model.api === "openai-responses" || model.api === "openai-codex-responses" || adaptiveAnthropic;
+		const previousLimit = Math.floor(0.8 * preparation.settings.reserveTokens);
+		const maxTokens = canLimitOutput ? requestedLimit :
+			Math.min(previousLimit > 0 ? previousLimit : summaryMaxTokens, modelOutputLimit);
+		const targetTokens = Math.max(1, Math.floor(Math.min(requestedLimit, maxTokens) / 2));
+
+		// 2. Append the instruction without copying an already-cached checkpoint
+		// into its tail again. Use projection provenance, not text matching, so
+		// context edits stay authoritative. Keep a fallback for preparations whose
+		// previous summary is genuinely absent from the projected prefix.
+		const activeCheckpoint = projection.entries.find((entry) => entry.sourceEntry.type === "compaction");
+		const previousSummarySource = prefixMessages.some((message) => message.role === "compactionSummary")
+			? "prefix" : activeCheckpoint?.messages.length === 0 ? "omitted" :
+				preparation.previousSummary ? "appended" : "none";
 		let promptText = SUMMARY_ROLE + "\n\n";
-		if (preparation.previousSummary) {
+		if (previousSummarySource === "appended") {
 			promptText += `<previous-summary>\n${preparation.previousSummary}\n</previous-summary>\n\n`;
 		}
-		promptText += preparation.previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+		if (previousSummarySource === "prefix" || previousSummarySource === "appended") promptText += UPDATE_SUMMARIZATION_PROMPT;
+		promptText += SUMMARIZATION_PROMPT;
 		// Steer thinking in the appended prompt rather than in the request
 		// (changing the request's thinking mode would force a full prefill):
 		// the summary is short structured output, so we don't want a long
 		// thinking phase on it. "off" asks the model to skip thinking entirely;
 		// "inherit" (default) asks it to keep thinking brief.
 		promptText += thinkingChoice === "off" ? NO_THINKING_INSTRUCTION : BRIEF_THINKING_INSTRUCTION;
+		promptText += summarySizeInstruction(targetTokens);
 		if (customInstructions) {
 			promptText += `\n\nAdditional focus: ${customInstructions}`;
 		}
@@ -635,15 +807,10 @@ export default function (pi: ExtensionAPI) {
 			],
 		});
 
-		// 3. One LLM call through the configured provider. Same token budget
-		//    and thinking level as the built-in compaction, and the same
-		//    session id the agent uses so cache-aware backends route to the
-		//    same cache. Cache retention stays at the default ("short") — we
-		//    want the read, unlike the built-in one-off which uses "none".
-		const maxTokens = Math.min(
-			Math.floor(0.8 * preparation.settings.reserveTokens),
-			model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-		);
+		// 3. One bounded LLM call through the configured provider, retaining the
+		//    session's thinking level and session id for cache routing. Cache
+		//    retention stays at "short": we want the cached-prefix read, unlike
+		//    the built-in one-off which uses "none".
 		// Mirror pi's request wrapper (sdk.ts buildRequestOptions): the agent's
 		// requests carry the provider timeout/transport/retry settings from pi's
 		// settings, so the compaction request uses the same values.
@@ -662,6 +829,7 @@ export default function (pi: ExtensionAPI) {
 			websocketConnectTimeoutMs?: number;
 			transport?: PiSettings["transport"];
 			thinkingBudgets?: PiSettings["thinkingBudgets"];
+			onPayload?: SimpleStreamOptions["onPayload"];
 		} = {
 			maxTokens,
 			signal,
@@ -682,17 +850,18 @@ export default function (pi: ExtensionAPI) {
 		if (settings.thinkingBudgets !== undefined) {
 			streamOptions.thinkingBudgets = settings.thinkingBudgets;
 		}
-		// Thinking level for the summarization call: always the session's own
-		// level. We never change the thinking mode in the request — with some
-		// models the thinking mode is applied at the chat-template level (the
-		// template injects different prompts into the running chat), so
-		// switching it mid-session changes the prompt structure and forces a
-		// full prefill of the whole conversation. Keeping the request identical
-		// to the agent's last request is what lets the backend reuse the prompt
-		// cache. To make the model think less we steer it in the appended
-		// prompt instead (BRIEF_THINKING_INSTRUCTION / NO_THINKING_INSTRUCTION).
+		// Changing top-level effort can rewrite hidden instructions even on
+		// OpenAI and lose the prefix cache. Always retain the session's setting.
 		if (model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== "off") {
 			streamOptions.reasoning = ctx.thinkingLevel;
+		}
+		if (reasoningUpdate !== undefined) {
+			// Native adapters invoke onPayload after wire conversion, before the
+			// request is sent. Change only this summary turn's effort marker;
+			// ordinary requests, top-level thinking, and history stay untouched.
+			streamOptions.onPayload = (payload) => reasoningUpdate.kind === "anthropic"
+				? withAnthropicCompactionEffort(payload, reasoningUpdate.effort)
+				: withCompactionReasoningUpdate(payload, reasoningUpdate.effort);
 		}
 
 		// Same agent-level retry policy pi's built-in compaction uses
@@ -759,7 +928,7 @@ export default function (pi: ExtensionAPI) {
 			if (r.stopReason === "error") {
 				throw new Error(`Summarization failed: ${r.errorMessage || "Unknown error"}`);
 			}
-			if (r.stopReason === "length" && !hasToolCall(r)) {
+			if (r.stopReason === "length") {
 				throw new Error("Summarization failed: generation hit the token cap and the summary is incomplete");
 			}
 		};
@@ -776,8 +945,27 @@ export default function (pi: ExtensionAPI) {
 			throw new Error("Summarization returned no text");
 		}
 
-		// 5. Same cumulative file tracking as the built-in compaction.
-		const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+		// 5. Keep file tracking cumulative even for fromHook checkpoints, whose
+		// details Pi does not merge into preparation.fileOps. Do not depend on
+		// the model copying tracking XML or mutate the caller's operation sets.
+		const fileOps = {
+			read: new Set(preparation.fileOps.read),
+			written: new Set(preparation.fileOps.written),
+			edited: new Set(preparation.fileOps.edited),
+		};
+		for (const entry of projection.entries.slice(0, cutIndex)) {
+			if (entry.sourceEntry.type !== "compaction" ||
+				!entry.messages.some((message) => message.role === "compactionSummary")) continue;
+			const details: unknown = entry.sourceEntry.details;
+			if (!isObject(details) || details.strategy !== "better-compaction") continue;
+			if (Array.isArray(details.readFiles)) {
+				for (const path of details.readFiles) if (typeof path === "string") fileOps.read.add(path);
+			}
+			if (Array.isArray(details.modifiedFiles)) {
+				for (const path of details.modifiedFiles) if (typeof path === "string") fileOps.written.add(path);
+			}
+		}
+		const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 		const summary = summaryText + formatFileOperations(readFiles, modifiedFiles);
 
 		// 6. Stash the report (measured on the final attempt — `timing` is
@@ -799,7 +987,13 @@ export default function (pi: ExtensionAPI) {
 				firstKeptEntryId: preparation.firstKeptEntryId,
 				tokensBefore: preparation.tokensBefore,
 				usage: response.usage,
-				details: { readFiles, modifiedFiles, strategy: "better-compaction" },
+				details: {
+					readFiles, modifiedFiles, strategy: "better-compaction",
+					summaryBudget: { targetTokens, maxTokens }, previousSummarySource,
+					...(reasoningUpdate !== undefined ? { reasoningUpdate } : {}),
+					promptProjection: observedOptions === undefined ? "unobserved" :
+						forcedPrompt !== undefined ? "forced-system-prompt" : "transcript",
+				},
 			},
 		};
 	});

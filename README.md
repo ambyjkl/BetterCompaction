@@ -39,9 +39,26 @@ The "kept tail" — the most recent messages that pi retains verbatim after
 compaction — is deliberately not sent, so the summary doesn't re-describe
 messages that remain in the session.
 
-Everything else works exactly like pi's normal compaction: same summary
-format, same bookkeeping, same file tracking, same events, same kept-messages
-rebuild. The extension only supplies the summary through the
+Request-only system-prompt overrides are mirrored too. For example,
+`pi-smart-timeout` returns a replacement prompt from `before_agent_start`;
+Pi collapses the prompt and current tools into one request header without
+persisting that replacement. Better Compaction observes those run options and
+applies the same projection, including the full current tool state even when
+some tool updates are in the kept tail.
+
+**After loading/reloading or switching sessions, send a normal message before
+compacting** if you use request-only prompt overrides. Their previous values
+are not recoverable from the session file. The extension warns when it has not
+observed a run and uses the stored transcript rather than guessing an override.
+Compaction details record the projection as `forced-system-prompt`, `transcript`,
+or `unobserved` for diagnostics.
+
+Repeated compactions reuse the checkpoint already in the cached prefix instead
+of copying it into the final instruction again. The model rewrites a concise
+operational checkpoint rather than growing a historical log.
+
+The summary format, bookkeeping, file tracking, events, and kept-messages
+rebuild follow pi's normal compaction lifecycle. The extension only supplies the summary through the
 `session_before_compact` event; pi does the rest with its normal path.
 
 ## Benchmarks
@@ -91,10 +108,10 @@ pi update --extensions   # reconcile to the pinned ref later
 
 | Command | Effect |
 | --- | --- |
-| `/bc` | Show effective options: enabled or not, compaction thinking level, session thinking level, and which settings file provides the config |
+| `/bc` | Show effective options: enabled or not, summary budget, compaction thinking level, session thinking level, and which settings file provides the config |
 | `/bc on` | Enable the extension (default) |
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
-| `/bc thinking off\|inherit` | Set the summarization thinking level |
+| `/bc thinking off\|inherit` | Select minimal/no reasoning for supported OpenAI models, low effort for supported Anthropic models, or prompt-only steering elsewhere; `/bc` shows which mechanism applies |
 | `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
 
 `/bc` writes to the settings file that **currently provides** the
@@ -112,6 +129,7 @@ compaction time, so they apply at the **next compaction** without restarting.
   "betterCompaction": {
     "enabled": true,
     "report": true,
+    "summaryMaxTokens": 8192,
     "thinking": "inherit"
   }
 }
@@ -121,36 +139,107 @@ compaction time, so they apply at the **next compaction** without restarting.
 | --- | --- | --- |
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
 | `report` | `true` | `false` → don't append the "Compaction completed in Xs ..." message to the chat after a compaction (toggle with `/bc report off`) |
-| `thinking` | `"inherit"` | Thinking level for the summarization call: `"inherit"` (the model keeps thinking, but the prompt asks it to keep thinking brief), `"off"` (the prompt asks it to skip thinking entirely and go straight to the summary). In both cases the request itself always runs at the session's own thinking level — see below |
+| `thinking` | `"inherit"` | `"inherit"` keeps the session level and asks for brief thinking. `"off"` uses an append-only effort update on supported native OpenAI models (`none`, or the lowest supported effort) and Anthropic models (`low`). Other models use prompt-only steering. The top-level thinking/effort never changes — see below |
+| `summaryMaxTokens` | `8192` | Requested generation budget; integer of at least `1024`. The prompt targets half the budget for summary text (default **4096 tokens**), reduced for smaller model limits. Provider limitations apply — see below |
 
-### How thinking is handled (and why the thinking mode is never changed)
+### Summary size and repeated compaction
 
-Summaries are short structured output, but a reasoning model with thinking
-enabled will still burn a long thinking phase on them — on local backends the
-thinking phase dominates compaction time. The old design answered this with a
-`"low"` thinking level plus a max-thinking-tokens cap. That design is gone, for
-a cache reason:
+The appended instruction asks for a complete checkpoint within a **4096-token
+text target** by default. It prioritizes current goals, constraints, active work,
+blockers, and next steps; completed work is consolidated into a few outcomes.
+Old experiment logs and artifact catalogs should be referenced through their
+on-disk documents, not reproduced. An oversized previous checkpoint is condensed,
+not treated as a minimum length.
 
-With some models the thinking mode is applied at the **chat-template level**.
-The template injects different prompts into the running chat depending on the
-mode, so switching the thinking mode (or disabling thinking) mid-session
-changes the prompt structure — and that forces the backend to **re-prefill the
-whole conversation**, exactly the cost this extension exists to avoid.
+The previous checkpoint stays untouched in the cached conversation prefix. It is
+not copied into the appended instruction a second time. A fallback copy is used
+only when the preparation supplies a checkpoint that is genuinely absent from
+the projection; explicitly omitted checkpoints are never restored.
 
-So the summarization request always runs at the **session's own thinking
-level**, identical to the agent's last request, and the prompt cache is reused
-instead of being thrown away. To make the model think less, the extension
-steers it in the appended compaction prompt instead:
+`summaryMaxTokens` is **not a universal hard limit**. OpenAI Responses and adaptive
+Anthropic requests receive the requested output budget, capped by the model.
+Codex's adapter does **not** send a wire output-token cap, so it relies on the
+appended text target. For budget-based thinking adapters, the existing generation
+ceiling is retained: shrinking it can change a rendered thinking budget and lose
+the prefix cache. Providers may also count or reserve reasoning tokens differently.
+The text target does not grow just because `compaction.reserveTokens` is large.
+Increase `summaryMaxTokens` in settings if your checkpoint genuinely needs more
+space; `/bc` shows the configured budget.
 
-- `"inherit"` (default) appends a short instruction telling the model to keep
-  its thinking brief (this is what the `"low"` cap used to achieve).
-- `"off"` appends a stronger instruction telling the model that thinking is
-  disabled for this task and to stop thinking immediately and go straight to
-  writing the summary. The request still technically carries the session's
-  thinking level (to keep the cache), but the model is told not to use it.
+A token-capped response is rejected rather than saved as a partial checkpoint,
+even if it contains tool calls. File-operation tracking is appended by the
+extension, outside the model's text budget, and merged from its previous
+checkpoint metadata; the model is told not to generate duplicate tracking XML.
+Compaction details record `summaryBudget` and `previousSummarySource` for diagnostics.
+No existing session or checkpoint is rewritten in place.
 
-This is why there is no longer any way to change the request's thinking mode:
-every path keeps it identical to the session's.
+### How thinking is handled without rewriting the cached prefix
+
+Changing top-level thinking settings can rewrite a model's rendered prompt
+and lose the prefix cache. This affects local chat templates, **OpenAI's hidden
+instructions, and Anthropic's rendered thinking configuration**. Better
+Compaction therefore always keeps the session's
+top-level reasoning setting, even when the session is at `max`.
+
+- `"inherit"` (default) keeps that effort and appends a brief-thinking prompt.
+- `"off"` on native **OpenAI GPT-6-family Responses/Codex models** appends a
+  `configuration_update` immediately before the summary instruction. Its effort
+  is `none` where supported, otherwise the lowest level allowed by Pi's model
+  metadata, mapped to the provider's wire value (for example, `low` on a model
+  that cannot disable reasoning). The earlier input items and top-level effort
+  are unchanged.
+- `"off"` on native **Anthropic Messages models** with
+  `compat.supportsMidConvoEffort: true` requests **`low` per-message effort**.
+  Pi already appends an effort-only system message after the summary user turn;
+  only that final marker is changed. Historical markers, signed thinking blocks,
+  cache controls, and top-level thinking/effort stay unchanged. **`low` does not
+  guarantee zero thinking.** Already-disabled sessions are left alone; models
+  that cannot disable thinking can still lower effort in their adaptive mode.
+- `"off"` on other models/backends remains **best-effort prompt-only steering**:
+  it asks the model to skip thinking, but does not disable API reasoning.
+
+For example, a `max` session with `/bc thinking off` on GPT-6.1 Terra sends
+this item just before the summary prompt, while top-level effort stays `max`:
+
+```json
+{ "type": "configuration_update", "reasoning": { "effort": "none" } }
+```
+
+On supported Anthropic models, the final summary turn instead ends with:
+
+```json
+{ "role": "system", "content": [], "output_config": { "effort": "low" } }
+```
+
+This requires adaptive thinking and the
+`mid-conversation-output-config-2026-07-01` beta, which Pi enables for models
+with the verified compatibility flag. The extension validates the existing
+mode, beta, and terminal marker rather than changing top-level settings or
+silently guessing support. Custom providers, Bedrock, and models without the
+flag retain prompt-only steering. Compaction details record the selected
+`reasoningUpdate` for diagnostics.
+
+`/bc` and `/bc thinking off` show the selected mechanism and effort, or explicitly
+say `prompt only; API thinking unchanged`. Switch back with `/bc thinking inherit`.
+The update exists only in the summarization request: it does not lower the main
+agent's effort or persist in the session history. Unsupported-update API errors
+are surfaced; the extension does not silently retry with changed top-level effort.
+
+This uses Pi's existing `onPayload` hook after provider wire conversion, before
+the request is sent. No Pi patch is needed. Server acceptance and cache reuse
+still need to be verified for the selected endpoint, especially custom gateways.
+OpenAI compatibility is restricted to the native `openai` and `openai-codex`
+providers with GPT-6-family IDs and Responses APIs; Anthropic compatibility is
+restricted to the native `anthropic` provider and its verified per-message effort
+flag. No model-name heuristic enables Anthropic support.
+
+See OpenAI's [reasoning-update documentation](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation)
+and [cache-affecting settings](https://developers.openai.com/api/docs/guides/prompt-caching).
+Their restrictions on server-side automatic compaction/truncation do not refer
+to Pi's local compaction; this extension generates a summary through an ordinary
+Responses request, not `/responses/compact`.
+For Anthropic, see [per-message effort](https://platform.claude.com/docs/en/build-with-claude/effort#change-effort-mid-conversation)
+and [cache-affecting settings](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#what-invalidates-the-cache).
 
 ### Notifications
 
@@ -166,9 +255,9 @@ every path keeps it identical to the session's.
   appended for pi's built-in compaction (the report is stashed per session
   during `session_before_compact` and only exists when this extension
   supplied the summary; a failed compaction discards the stashed report).
-- **Once per session, when compaction will run with thinking turned off:**
-  `Better Compaction: compaction will run with thinking turned off — some models
-  summarize significantly worse (or not at all) without it`
+- **Once per session, when no-thinking compaction is requested:** reports the
+  append-only effort update, or warns that the model only has prompt-level
+  steering. Some models summarize worse without reasoning.
 
 The extension also mirrors the settings pi applies to normal agent requests
 (`images.blockImages`, `retry.*`, provider timeouts, transport, thinking
@@ -205,13 +294,16 @@ better-compaction/
   (`<pi-install>/dist/index.d.ts` and
   `<pi-install>/node_modules/@earendil-works/pi-ai/dist/index.d.ts`).
 - Known limitations (documented, intentional):
-  - If other extensions or pi features transform the LLM context
-    (`transformContext` handlers, forced prompts), the rebuilt prefix may no
-    longer be byte-identical to the agent's actual request; cache reuse then
-    degrades gracefully to a shorter shared prefix.
+  - Forced prompts returned by `before_agent_start` are mirrored once a run
+    has been observed. Arbitrary `context`/`context_with_system` transformations,
+    hidden tool declarations, or provider-payload rewrites are not replayed;
+    they can still make the rebuilt prefix differ and reduce or eliminate cache
+    reuse. A cache hit is not guaranteed.
   - Provider attribution headers (telemetry) that pi adds for a few specific
     providers are not replicated; they don't affect prompt caching.
-  - File tracking has the same `fromHook` gap as the built-in compaction.
+  - Pi does not merge file tracking from arbitrary extension-generated
+    checkpoints. Better Compaction carries its own checkpoint metadata forward;
+    other extensions' custom tracking formats are not interpreted.
 
 ## License
 
