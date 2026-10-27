@@ -194,6 +194,41 @@ Do not generate <read-files> or <modified-files> lists: the extension appends fi
 }
 
 /**
+ * Anthropic reads a cache entry only where an earlier request wrote one (at its
+ * own explicit breakpoints, found by a 20-block lookback); it cannot match an
+ * arbitrary mid-conversation cut. So on Anthropic the summary request keeps the
+ * whole conversation, whose end is exactly where the agent's last request wrote
+ * its entry, and this scope note limits the summary to the messages before the cut.
+ */
+function retainedTailScope(retainedStart: string): string {
+	return `SCOPE: the conversation above continues past the compaction boundary. Summarize ONLY the messages BEFORE the boundary. The boundary is the message that ${retainedStart}; that message and every message after it stay in the session verbatim after compaction. Do not summarize or restate them; use them only to judge which earlier facts are still relevant. Ignore the "messages above" wording below wherever it conflicts with this scope.
+
+`;
+}
+
+/** Short description of the first retained message, used to mark the boundary. */
+function describeRetainedStart(messages: LlmMessage[]): string | undefined {
+	const message = messages.find((m) => m.role !== "system");
+	if (!message) return undefined;
+	const blocks: unknown[] = typeof message.content === "string"
+		? [{ type: "text", text: message.content }] : message.content;
+	let excerpt = "";
+	let toolCall = "";
+	for (const block of blocks) {
+		if (!isObject(block)) continue;
+		if (block.type === "text" && typeof block.text === "string" && !excerpt) excerpt = block.text;
+		else if (block.type === "toolCall" && typeof block.name === "string" && !toolCall) toolCall = block.name;
+	}
+	excerpt = excerpt.replace(/\s+/g, " ").trim();
+	const role = message.role === "toolResult" ? "tool result" : message.role;
+	if (excerpt) {
+		const clipped = excerpt.length > 160 ? `${excerpt.slice(0, 160)}...` : excerpt;
+		return `is the ${role} message starting with: ${JSON.stringify(clipped)}`;
+	}
+	return toolCall ? `is the assistant message calling the tool ${toolCall}` : `is the ${role} message that follows`;
+}
+
+/**
  * Appended to every compaction prompt (the default "inherit" mode). The
  * summary is short structured output, so we tell the model not to over-invest
  * thinking in it. This replaces the old per-level thinking-token cap: capping
@@ -680,6 +715,8 @@ export default function (pi: ExtensionAPI) {
 		// the conversation up to the cut is a prefix of that, so prefix/KV
 		// caches still cover it. The kept tail is deliberately omitted: the
 		// summarizer must not re-describe messages that stay in the session.
+		// Exception: Anthropic matches only earlier breakpoints (see
+		// retainedTailScope), so there the tail stays and the prompt scopes it out.
 		//
 		// The prefix is rebuilt from the EDIT-AWARE projection
 		// (buildSessionProjection), not the raw entries: the agent's actual LLM
@@ -695,7 +732,13 @@ export default function (pi: ExtensionAPI) {
 		const cutIndex = projection.entries.findIndex((e) => e.sourceEntry.id === preparation.firstKeptEntryId);
 		if (cutIndex < 1) return; // nothing to summarize — let pi decide
 		const prefixMessages = projection.entries.slice(0, cutIndex).flatMap((e) => e.messages);
-		let llmMessages = convertToLlm(prefixMessages);
+		// Anthropic only reads cache entries at earlier breakpoints, so keep the
+		// full conversation there and scope the summary with the prompt instead.
+		const keepRetainedTail = model.api === "anthropic-messages";
+		const retainedMessages = keepRetainedTail
+			? projection.entries.slice(cutIndex).flatMap((e) => e.messages) : [];
+		const retainedStart = describeRetainedStart(convertToLlm(retainedMessages));
+		let llmMessages = convertToLlm(retainedStart ? [...prefixMessages, ...retainedMessages] : prefixMessages);
 
 		// Mirror Pi's request-only forced-prompt projection (e.g. smart-timeout).
 		// It collapses ALL system deltas and the CURRENT tool set into one head,
@@ -780,6 +823,7 @@ export default function (pi: ExtensionAPI) {
 			? "prefix" : activeCheckpoint?.messages.length === 0 ? "omitted" :
 				preparation.previousSummary ? "appended" : "none";
 		let promptText = SUMMARY_ROLE + "\n\n";
+		if (retainedStart) promptText += retainedTailScope(retainedStart);
 		if (previousSummarySource === "appended") {
 			promptText += `<previous-summary>\n${preparation.previousSummary}\n</previous-summary>\n\n`;
 		}

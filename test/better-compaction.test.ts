@@ -740,6 +740,30 @@ describe("bounded summaries and repeated compaction", () => {
 		expect(summary.chat_template_kwargs).toEqual(normal.chat_template_kwargs);
 	});
 
+	test("Anthropic keeps the retained tail so its cache entry matches, scoping the summary to the cut", async () => {
+		const { api, ctx, event } = setup();
+		const model = { ...ctx.model, api: "anthropic-messages", provider: "anthropic", reasoning: false };
+		await fire(api, "session_before_compact", event, { ...ctx, model });
+		const messages = (ctx.calls[0]![1] as TranscriptContext).messages;
+		const text = (i: number) => JSON.stringify(messages[i]);
+		expect(messages).toHaveLength(6);
+		expect(text(0)).toContain("Read the codebase");
+		expect(text(2)).toContain("Now add a config file option.");
+		expect(text(4)).toContain("Great, commit it.");
+		const prompt = text(5);
+		expect(prompt).toContain("Summarize ONLY the messages BEFORE the boundary");
+		expect(prompt).toContain('the user message starting with: \\"Now add a config file option.\\"');
+	});
+
+	test("other providers send only the prefix before the cut, with no scope note", async () => {
+		const { api, ctx, event } = setup();
+		await fire(api, "session_before_compact", event, ctx);
+		const messages = (ctx.calls[0]![1] as TranscriptContext).messages;
+		expect(messages).toHaveLength(3);
+		expect(JSON.stringify(messages)).not.toContain("Now add a config file option.");
+		expect(JSON.stringify(messages.at(-1))).not.toContain("SCOPE:");
+	});
+
 	test.each(["text", "tool", "mixed"])("never persists a token-capped partial checkpoint (%s)", async (kind) => {
 		const response = makeSummaryMessage({ stopReason: "length", text: kind === "tool" ? "" : "## Goal\nIncomplete checkpoint" });
 		const { api, ctx, event } = setup({ response: kind !== "text" ? {
@@ -951,7 +975,20 @@ describe("append-only Anthropic compaction effort", () => {
 		expect(baseline.thinking.type).toBe("adaptive");
 		expect(updated.messages).toEqual([...baseline.messages.slice(0, -1), marker("low")]);
 		expect({ ...updated, messages: baseline.messages }).toEqual(baseline);
-		expect(updated.messages.slice(0, -2)).toEqual(main.messages.slice(0, updated.messages.length - 2));
+		// Anthropic reads only entries written at earlier breakpoints, so the
+		// summary request keeps the retained tail: the agent's whole last request
+		// is an exact prefix (modulo where its cache breakpoint sat), and the
+		// cut-only prefix is NOT what is sent.
+		const plain = (messages: unknown[]) => (JSON.parse(JSON.stringify(messages), (key, value) =>
+			key === "cache_control" ? undefined : value) as { content: unknown }[]).map((m) => ({
+			...m, content: typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content,
+		}));
+		// The agent's own trailing effort marker is replaced by the summary turn's.
+		expect(main.messages.at(-1)).toEqual(marker("max"));
+		expect(updated.messages).toHaveLength(main.messages.length + 1);
+		expect(plain(updated.messages.slice(0, -2))).toEqual(plain(main.messages.slice(0, -1)));
+		expect(JSON.stringify(updated.messages.at(-2))).toContain("Summarize ONLY the messages BEFORE the boundary");
+		expect(JSON.stringify(updated.messages.at(-2))).toContain("Now add a config file option.");
 		expect(JSON.stringify(updated.messages.slice(0, -2))).toContain("synthetic-signature");
 		expect(JSON.stringify(updated.messages.slice(0, -2))).toContain('"effort":"xhigh"');
 		expect({ ...updated, messages: main.messages, max_tokens: main.max_tokens }).toEqual(main);
