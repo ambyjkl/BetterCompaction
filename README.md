@@ -39,6 +39,15 @@ The "kept tail" — the most recent messages that pi retains verbatim after
 compaction — is deliberately not sent, so the summary doesn't re-describe
 messages that remain in the session.
 
+**Anthropic is the exception.** It reads cache entries only at positions an
+earlier request wrote (its explicit breakpoints, found by a 20-block
+lookback), not at an arbitrary cut. A request truncated mid-conversation reads
+only the system prompt and tools, which showed up as ~4k cache-read tokens out
+of ~125k. On `anthropic-messages` models the request therefore keeps the whole
+conversation, ending exactly where the agent's last request wrote its cache
+entry, and the appended instruction names the boundary and tells the model to
+summarize only what comes before it.
+
 Request-only system-prompt overrides are mirrored too. For example,
 `pi-smart-timeout` returns a replacement prompt from `before_agent_start`;
 Pi collapses the prompt and current tools into one request header without
