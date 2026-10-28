@@ -1159,6 +1159,61 @@ describe("append-only OpenAI compaction reasoning", () => {
 	);
 });
 
+describe("idle configuration commands", () => {
+	test("honors merged Pi auto-compaction settings and reports why idle compaction is blocked", async () => {
+		const cwd = join(tmp, "auto-compaction-config");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		const globalPath = join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+		const projectPath = join(cwd, ".pi", "settings.json");
+		writeFileSync(globalPath, JSON.stringify({ compaction: { enabled: false } }));
+		writeFileSync(projectPath, JSON.stringify({ betterCompaction: { idleCompaction: true } }));
+		const api = freshExtension();
+		const notices: string[] = [];
+		const ctx = {
+			...makeCtx({ sessionId: "auto-config", cwd, notify: (message) => notices.push(message), messages: [] }),
+			mode: "tui",
+		};
+		const command = api.commands.get("bc")!;
+		try {
+			await fire(api, "session_start", {}, ctx);
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("Pi auto-compaction is disabled");
+			// Project settings override global settings, and edits are read live.
+			writeFileSync(projectPath, JSON.stringify({ compaction: { enabled: true }, betterCompaction: { idleCompaction: true } }));
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("waiting for a normal model request");
+			writeFileSync(projectPath, JSON.stringify({ compaction: { enabled: false }, betterCompaction: { idleCompaction: true } }));
+			await command.handler("", ctx);
+			expect(notices.at(-1)).toContain("Pi auto-compaction is disabled");
+		} finally {
+			await fire(api, "session_shutdown", {}, ctx);
+			rmSync(globalPath);
+		}
+	});
+
+	test("reports opt-in idle compaction with a 50% default threshold", async () => {
+		const api = freshExtension();
+		const notices: string[] = [];
+		const ctx = makeCtx({ sessionId: "config-default", cwd: projectDir, notify: (message) => notices.push(message), messages: [] });
+		await api.commands.get("bc")!.handler("", ctx);
+		expect(notices[0]).toContain("idle: off (>=50% context, 60s before expiry)");
+	});
+
+	test("writes the boolean option to the effective project config without losing the custom threshold", async () => {
+		const cwd = join(tmp, "idle-config");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		const path = join(cwd, ".pi", "settings.json");
+		writeFileSync(path, JSON.stringify({ betterCompaction: { idleCompactionThreshold: 0.25 }, other: "preserved" }));
+		const api = freshExtension();
+		const ctx = makeCtx({ sessionId: "config-project", cwd, notify: () => {}, messages: [] });
+		const command = api.commands.get("bc")!;
+		await command.handler("idle off", ctx);
+		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ betterCompaction: { idleCompactionThreshold: 0.25, idleCompaction: false }, other: "preserved" });
+		await command.handler("idle on", ctx);
+		expect(JSON.parse(readFileSync(path, "utf8")).betterCompaction).toEqual({ idleCompactionThreshold: 0.25, idleCompaction: true });
+	});
+});
+
 describe("post-compaction report lifecycle", () => {
 	test("manual compaction still works when Pi auto-compaction is disabled", async () => {
 		const cwd = join(tmp, "manual-auto-disabled");
