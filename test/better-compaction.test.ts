@@ -880,6 +880,14 @@ describe("append-only Anthropic compaction effort", () => {
 		expect(await options.onPayload!(updated, ctx.model)).toBe(updated);
 	});
 
+	test("gives adaptive Anthropic thinking headroom beyond the summary budget without raising the text target", async () => {
+		const { options, result } = await prepare();
+		expect(options.maxTokens).toBe(8192 + 16_384);
+		expect(result).toHaveProperty("compaction.details.summaryBudget", { targetTokens: 4096, maxTokens: 8192 + 16_384 });
+		const capped = await prepare({ maxTokens: 10_000 });
+		expect(capped.options.maxTokens).toBe(10_000);
+	});
+
 	test("inherit keeps the native effort untouched", async () => {
 		const { options } = await prepare({}, "inherit");
 		expect(options.reasoning).toBe("max");
