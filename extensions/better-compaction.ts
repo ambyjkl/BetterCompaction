@@ -124,6 +124,7 @@ import { Text } from "@earendil-works/pi-tui";
  * the conversation.
  */
 const DEFAULT_SUMMARY_MAX_TOKENS = 8192;
+const ANTHROPIC_THINKING_HEADROOM_TOKENS = 16_384;
 
 const SUMMARY_ROLE = `
 <system>
@@ -810,7 +811,13 @@ export default function (pi: ExtensionAPI) {
 		const canLimitOutput = !model.reasoning || !ctx.thinkingLevel || ctx.thinkingLevel === "off" ||
 			model.api === "openai-responses" || model.api === "openai-codex-responses" || adaptiveAnthropic;
 		const previousLimit = Math.floor(0.8 * preparation.settings.reserveTokens);
-		const maxTokens = canLimitOutput ? requestedLimit :
+		// Anthropic's max_tokens covers thinking AND text, and on adaptive models
+		// it is not rendered into the prompt, so it is safe to raise: give thinking
+		// headroom on top of the summary budget instead of letting a long think
+		// truncate the checkpoint. The text target below is unaffected.
+		const thinkingHeadroom = adaptiveAnthropic && model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== "off"
+			? ANTHROPIC_THINKING_HEADROOM_TOKENS : 0;
+		const maxTokens = canLimitOutput ? Math.min(requestedLimit + thinkingHeadroom, modelOutputLimit) :
 			Math.min(previousLimit > 0 ? previousLimit : summaryMaxTokens, modelOutputLimit);
 		const targetTokens = Math.max(1, Math.floor(Math.min(requestedLimit, maxTokens) / 2));
 
