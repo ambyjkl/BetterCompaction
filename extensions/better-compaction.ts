@@ -54,6 +54,11 @@
  *                             // per-message effort update to "low" instead.
  *                             // Other backends use prompt-only steering.
  *                             // "inherit" asks the model to keep thinking brief.
+ *     "files": "full",  // "full" (default) | "compact" | "none". The file
+ *                       // inventory appended to the summary. "compact" drops
+ *                       // nonexistent paths, writes $HOME as ~ and factors
+ *                       // shared prefixes as bash brace expansions.
+ *                       // "none" appends no inventory.
  *   }
  *
  * Options can also be managed at runtime with the /bc command:
@@ -63,6 +68,7 @@
  *   /bc on | /bc off          enable / disable the extension (the built-in
  *                             compaction takes over when disabled)
  *   /bc thinking off|inherit  set the summarization thinking level
+ *   /bc files full|compact|none  choose the file inventory format
  *   /bc report on|off         show / hide the post-compaction report message
  *                             (timing and cache read)
  *   /bc idle on|off           enable / disable idle compaction (main TUI only)
@@ -96,8 +102,9 @@
  * continuing the conversation and calling tools. Models that attempt a tool
  * call anyway are handled gracefully (see the validation step).
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildSessionProjection,
@@ -281,6 +288,110 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 }
 
 // ---------------------------------------------------------------------------
+// File inventory ("files": full | compact | none)
+// ---------------------------------------------------------------------------
+
+export type FileInventoryMode = "full" | "compact" | "none";
+
+export interface FileInventoryEnv {
+	cwd: string;
+	home: string;
+	/** False only when the path is known not to exist; unknown errors keep the entry. */
+	exists(absolutePath: string): boolean;
+}
+
+export function pathExists(path: string): boolean {
+	try {
+		statSync(path);
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code !== "ENOENT" && code !== "ENOTDIR";
+	}
+}
+
+interface InventoryNode {
+	children: Map<string, InventoryNode>;
+	end: boolean;
+}
+
+/** Characters that would be ambiguous or expand in a bash brace expression. */
+const UNSAFE_SEGMENT = /[\s,{}\\'"`$!*?[\]()<>|&;#]/;
+
+/**
+ * Render a sorted trie node's continuation after its own name. A single child
+ * extends the path; several children (or a path that is both an entry and a
+ * parent) become one bash brace expansion, e.g. `/{a,b/{c,d}}`.
+ */
+function renderInventoryTail(node: InventoryNode): string {
+	const keys = [...node.children.keys()].sort();
+	if (keys.length === 0) return "";
+	const only = keys.length === 1 && !node.end ? node.children.get(keys[0]!)! : undefined;
+	if (only) return `/${keys[0]}${renderInventoryTail(only)}`;
+	const alternatives = keys.map((key) => `${node.end ? "/" : ""}${key}${renderInventoryTail(node.children.get(key)!)}`);
+	if (node.end) return `{,${alternatives.join(",")}}`;
+	return `/{${alternatives.join(",")}}`;
+}
+
+function toAbsolute(raw: string, env: FileInventoryEnv): string {
+	const home = env.home;
+	const expanded = raw === "~" ? home : raw.startsWith("~/") && home ? join(home, raw.slice(2)) : raw;
+	return resolve(env.cwd, expanded);
+}
+
+/**
+ * Token-saving file list: absolute paths (relative ones resolved against the
+ * cwd), `$HOME` written as `~`, nonexistent entries dropped, duplicates merged,
+ * and shared directory prefixes factored out as bash brace expansions, one
+ * line per root (`~`, `/`). Paths with characters that are ambiguous in a brace
+ * expression are listed separately as JSON strings. The output is lossless:
+ * expanding the lines yields exactly the surviving absolute paths.
+ */
+export function compactFileInventory(paths: Iterable<string>, env: FileInventoryEnv): string[] {
+	const home = env.home.length > 1 ? env.home.replace(/\/+$/, "") : "";
+	const roots = new Map<string, InventoryNode>();
+	const literal = new Set<string>();
+	const seen = new Set<string>();
+	for (const raw of paths) {
+		const absolute = toAbsolute(raw, { ...env, home });
+		if (seen.has(absolute)) continue;
+		seen.add(absolute);
+		if (!env.exists(absolute)) continue;
+		const underHome = home !== "" && (absolute === home || absolute.startsWith(`${home}/`));
+		const display = underHome ? `~${absolute.slice(home.length)}` : absolute;
+		const segments = display.split("/");
+		if (segments.some((segment) => UNSAFE_SEGMENT.test(segment))) {
+			literal.add(JSON.stringify(display));
+			continue;
+		}
+		let node: InventoryNode = roots.get(segments[0]!) ?? { children: new Map(), end: false };
+		roots.set(segments[0]!, node);
+		for (const segment of segments.slice(1)) {
+			const child: InventoryNode = node.children.get(segment) ?? { children: new Map(), end: false };
+			node.children.set(segment, child);
+			node = child;
+		}
+		node.end = true;
+	}
+	const lines = [...roots.keys()].sort().map((name) => `${name}${renderInventoryTail(roots.get(name)!)}`);
+	return [...lines, ...[...literal].sort()];
+}
+
+/** Absolute, existing, deduplicated paths for details tracking in "compact" mode. */
+function liveInventoryPaths(paths: Iterable<string>, env: FileInventoryEnv): string[] {
+	const result = new Set<string>();
+	for (const raw of paths) {
+		const absolute = toAbsolute(raw, env);
+		if (env.exists(absolute)) result.add(absolute);
+	}
+	return [...result].sort();
+}
+
+function isFileInventoryMode(value: unknown): value is FileInventoryMode {
+	return value === "full" || value === "compact" || value === "none";
+}
+
+// ---------------------------------------------------------------------------
 // pi settings
 //
 // pi's agent applies several settings to every LLM request (image blocking,
@@ -325,6 +436,12 @@ interface BetterCompactionSettings extends IdleCompactionSettings {
 	 * thinking setting is never changed.
 	 */
 	thinking?: "off" | "inherit";
+	/**
+	 * File inventory appended to the summary. "full" (default) lists every path
+	 * as pi does; "compact" lists only existing files, with $HOME as "~" and
+	 * shared prefixes as bash brace expansions; "none" appends nothing.
+	 */
+	files?: "full" | "compact" | "none";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -1020,9 +1137,9 @@ export default function (pi: ExtensionAPI) {
 	// /bc — inspect and control this extension's options.
 	pi.registerCommand("bc", {
 		description:
-			"Better Compaction: /bc [on|off|thinking off|inherit|report on|off|idle on|off] — show or change compaction options",
+			"Better Compaction: /bc [on|off|thinking off|inherit|files full|compact|none|report on|off|idle on|off] — show or change compaction options",
 		getArgumentCompletions: (prefix) => {
-			const options = ["on", "off", "thinking", "report", "idle"];
+			const options = ["on", "off", "thinking", "files", "report", "idle"];
 			const filtered = options.filter((o) => o.startsWith(prefix.toLowerCase()));
 			return filtered.length > 0
 				? filtered.map((o) => ({ value: o, label: o, description: "Better Compaction option" }))
@@ -1045,7 +1162,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(
 					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} (${thinkingMechanism(thinking)}) | ` +
 						`summary budget: ${section.summaryMaxTokens ?? DEFAULT_SUMMARY_MAX_TOKENS} tokens | ` +
-						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
+						`files: ${section.files ?? "full"} | report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
 						`idle: ${section.idleCompaction === true ? "on" : "off"} ` +
 						`(>=${(section.idleCompactionThreshold ?? IDLE_DEFAULTS.threshold) * 100}% context, ` +
 						`${section.idleCompactionBeforeExpirySeconds ?? IDLE_DEFAULTS.beforeExpirySeconds}s before expiry) | ` +
@@ -1084,6 +1201,16 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			if (arg.startsWith("files")) {
+				const value = arg.split(/\s+/)[1];
+				if (!isFileInventoryMode(value)) {
+					ctx.ui.notify("Better Compaction: usage: /bc files full|compact|none", "error");
+					return;
+				}
+				const path = writeBetterCompactionSetting(ctx.cwd, { files: value });
+				ctx.ui.notify(`Better Compaction: file inventory set to ${value} (written to ${path}; applies at the next compaction)`);
+				return;
+			}
 			if (arg.startsWith("report")) {
 				const value = arg.split(/\s+/)[1];
 				if (value !== "on" && value !== "off") {
@@ -1098,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				"Better Compaction: usage: /bc [on|off|thinking off|inherit|report on|off|idle on|off]",
+				"Better Compaction: usage: /bc [on|off|thinking off|inherit|files full|compact|none|report on|off|idle on|off]",
 				"error",
 			);
 		},
@@ -1204,6 +1331,11 @@ export default function (pi: ExtensionAPI) {
 		// reserveTokens controls WHEN Pi compacts, not how large the checkpoint
 		// should become. A large context-window reserve must not produce a huge
 		// summary. Pi's adapters still handle the unchanged thinking allowance.
+		const configuredFilesMode = settings.betterCompaction?.files;
+		if (configuredFilesMode !== undefined && !isFileInventoryMode(configuredFilesMode)) {
+			throw new Error('Better Compaction: files must be "full", "compact", or "none"');
+		}
+		const filesMode: FileInventoryMode = configuredFilesMode ?? "full";
 		const configuredSummaryMaxTokens = settings.betterCompaction?.summaryMaxTokens;
 		const summaryMaxTokens = configuredSummaryMaxTokens === undefined
 			? DEFAULT_SUMMARY_MAX_TOKENS : configuredSummaryMaxTokens;
@@ -1432,8 +1564,21 @@ export default function (pi: ExtensionAPI) {
 				for (const path of details.modifiedFiles) if (typeof path === "string") fileOps.written.add(path);
 			}
 		}
-		const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-		const summary = summaryText + formatFileOperations(readFiles, modifiedFiles);
+		let { readFiles, modifiedFiles } = computeFileLists(fileOps);
+		let inventory = "";
+		if (filesMode === "compact" && sep === "/") {
+			// Normalize before deduplicating so a path read relatively and modified
+			// absolutely is listed once; details stay absolute so later
+			// compactions (in any mode) merge them consistently.
+			const env: FileInventoryEnv = { cwd: ctx.cwd, home: process.env.HOME || homedir(), exists: pathExists };
+			modifiedFiles = liveInventoryPaths(modifiedFiles, env);
+			const modifiedSet = new Set(modifiedFiles);
+			readFiles = liveInventoryPaths(readFiles, env).filter((path) => !modifiedSet.has(path));
+			inventory = formatFileOperations(compactFileInventory(readFiles, env), compactFileInventory(modifiedFiles, env));
+		} else if (filesMode !== "none") {
+			inventory = formatFileOperations(readFiles, modifiedFiles);
+		}
+		const summary = summaryText + inventory;
 
 		// 6. Stash the report (measured on the final attempt — `timing` is
 		//    rewritten by every produce() call, so after the validation/retry

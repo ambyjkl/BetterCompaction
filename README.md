@@ -121,6 +121,7 @@ pi update --extensions   # reconcile to the pinned ref later
 | `/bc on` | Enable the extension (default) |
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
 | `/bc thinking off\|inherit` | Select minimal/no reasoning for supported OpenAI models, low effort for supported Anthropic models, or prompt-only steering elsewhere; `/bc` shows which mechanism applies |
+| `/bc files full\|compact\|none` | Choose the file inventory appended to each summary (see below) |
 | `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
 | `/bc idle on\|off` | Enable / disable idle compaction |
 
@@ -141,6 +142,7 @@ compaction time, so they apply at the **next compaction** without restarting.
     "report": true,
     "summaryMaxTokens": 8192,
     "thinking": "inherit",
+    "files": "full",
     "idleCompaction": false,
     "idleCompactionThreshold": 0.5,
     "idleCompactionBeforeExpirySeconds": 60
@@ -153,6 +155,7 @@ compaction time, so they apply at the **next compaction** without restarting.
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
 | `report` | `true` | `false` → don't append the "Compaction completed in Xs ..." message to the chat after a compaction (toggle with `/bc report off`) |
 | `thinking` | `"inherit"` | `"inherit"` keeps the session level and asks for brief thinking. `"off"` uses an append-only effort update on supported native OpenAI models (`none`, or the lowest supported effort) and Anthropic models (`low`). Other models use prompt-only steering. The top-level thinking/effort never changes — see below |
+| `files` | `"full"` | File inventory appended to the summary: `"full"` (pi's format), `"compact"`, or `"none"` — see below |
 | `summaryMaxTokens` | `8192` | Requested generation budget; integer of at least `1024`. The prompt targets half the budget for summary text (default **4096 tokens**), reduced for smaller model limits. Provider limitations apply — see below |
 
 ### Idle compaction
@@ -259,6 +262,33 @@ Cache TTLs are best-effort: a requested lifetime is not proof that the provider
 cached the prefix. Extensions that dynamically register a new payload transform
 after this extension's context handler can still hide the final TTL from the
 observer. No savings are guaranteed.
+
+### File inventory
+
+pi appends `<read-files>` and `<modified-files>` lists to every summary. They
+grow with the session and are re-sent on every request. `files` controls them:
+
+- `"full"` (default): every tracked path, exactly as pi writes it.
+- `"compact"`: existing files only (deleted or moved paths are dropped),
+  relative paths resolved against the cwd and duplicates merged, `$HOME` written
+  as `~`, and shared directories factored out as bash brace expansions, one line
+  per root:
+
+  ```
+  <read-files>
+  ~/{.pi/agent/npm/node_modules/{pi-btw/extensions/btw.ts,pi-smart-timeout/extensions/smart-timeout.ts},src/BetterCompaction/{README.md,package.json}}
+  </read-files>
+  ```
+
+  Expanding the line in bash gives exactly the surviving paths. Paths containing
+  whitespace, commas, braces, quotes or other shell-special characters are
+  listed separately as JSON strings. A real 22-path list shrank by about half.
+- `"none"`: no inventory in the summary.
+
+The cumulative tracking in the compaction entry's `details` is kept in every
+mode (it is not sent to the model), so switching modes later loses nothing —
+except that `"compact"` also prunes nonexistent paths from `details`. Earlier
+summaries already in the conversation are not rewritten.
 
 ### Summary size and repeated compaction
 

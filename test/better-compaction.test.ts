@@ -12,13 +12,14 @@
 /// <reference types="bun-types" />
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, copyFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildSessionProjection, convertToLlm, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
 import type { Api, AssistantMessage, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
-import extension from "../extensions/better-compaction";
+import extension, { compactFileInventory } from "../extensions/better-compaction";
 
 // ---------------------------------------------------------------------------
 // Mock harness
@@ -1446,5 +1447,116 @@ describe("edit-aware prefix rebuild (issue #3: context_edit projections)", () =>
 		// Replacement: the model sees the replacement, not the original content.
 		expect(sentText).toContain("Shortened answer.");
 		expect(sentText).not.toContain("Original long answer the model no longer sees.");
+	});
+});
+
+describe("file inventory", () => {
+	const env = (exists: (path: string) => boolean = () => true) => ({ cwd: "/work/project", home: "/home/amby", exists });
+	const expand = (line: string) => {
+		const run = spawnSync("bash", ["-c", `printf '%s\\n' ${line}`], { env: { HOME: "/home/amby", PATH: process.env.PATH ?? "" }, encoding: "utf8" });
+		return run.stdout.split("\n").filter(Boolean);
+	};
+
+	test("factors shared prefixes into brace expansions that bash expands losslessly", () => {
+		const paths = [
+			"/home/amby/src/a/x.ts", "/home/amby/src/a/y.ts", "/home/amby/src/a/test/z.ts", "/home/amby/.pi/agent/s.json",
+			"/etc/hosts", "/etc/passwd", "/opt/tool",
+		];
+		const lines = compactFileInventory(paths, env());
+		expect(lines).toEqual([
+			"/{etc/{hosts,passwd},opt/tool}",
+			"~/{.pi/agent/s.json,src/a/{test/z.ts,x.ts,y.ts}}",
+		]);
+		const expanded = lines.flatMap(expand);
+		expect(expanded.sort()).toEqual(paths.sort());
+		expect(lines.join("\n").length).toBeLessThan(paths.join("\n").length);
+	});
+
+	test("resolves relative and ~ paths, deduplicates, and drops nonexistent entries", () => {
+		const missing = new Set(["/work/project/gone.ts", "/home/amby/deleted"]);
+		const lines = compactFileInventory(
+			["src/a.ts", "./src/a.ts", "/work/project/src/a.ts", "~/notes.md", "/home/amby/notes.md", "gone.ts", "~/deleted", "../other/b.ts"],
+			env((path) => !missing.has(path)),
+		);
+		expect(lines).toEqual(["/work/{other/b.ts,project/src/a.ts}", "~/notes.md"]);
+	});
+
+	test("a path that is both an entry and a parent keeps the empty alternative", () => {
+		const lines = compactFileInventory(["/a/b", "/a/b/c", "/a/d"], env());
+		expect(lines).toEqual(["/a/{b{,/c},d}"]);
+		expect(expand(lines[0]!).sort()).toEqual(["/a/b", "/a/b/c", "/a/d"]);
+	});
+
+	test("home itself, a lookalike sibling, and an empty list", () => {
+		expect(compactFileInventory(["/home/amby", "/home/amby2/x"], env())).toEqual(["/home/amby2/x", "~"]);
+		expect(compactFileInventory([], env())).toEqual([]);
+		expect(compactFileInventory(["/gone"], env(() => false))).toEqual([]);
+	});
+
+	test("segments that are ambiguous in a brace expression are listed as JSON strings", () => {
+		const lines = compactFileInventory(["/p/a b.ts", "/p/c,d.ts", "/p/{x}.ts", "/p/ok.ts", "/p/q\nr.ts"], env());
+		expect(lines).toEqual(["/p/ok.ts", '"/p/a b.ts"', '"/p/c,d.ts"', '"/p/q\\nr.ts"', '"/p/{x}.ts"']);
+	});
+
+	describe("compaction summary", () => {
+		const originalHome = process.env.HOME;
+		afterAll(() => { process.env.HOME = originalHome; });
+
+		async function compact(files: unknown) {
+			const root = mkdtempSync(join(tmp, "inventory-"));
+			const cwd = join(root, "project");
+			mkdirSync(join(cwd, ".pi"), { recursive: true });
+			mkdirSync(join(cwd, "src"));
+			for (const name of ["README.md", "src/a.ts", "src/b.ts"]) writeFileSync(join(cwd, name), "");
+			writeFileSync(join(root, "notes.md"), "");
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ betterCompaction: files === undefined ? {} : { files } }));
+			process.env.HOME = root;
+			const api = freshExtension();
+			const ctx = makeCtx({ sessionId: "inventory", cwd, notify: () => {}, messages: [] });
+			const event = beforeCompactEvent("entry-2");
+			event.preparation.fileOps.read.add("README.md");
+			event.preparation.fileOps.read.add(join(root, "notes.md"));
+			event.preparation.fileOps.read.add("missing.ts");
+			event.preparation.fileOps.written.add("src/a.ts");
+			event.preparation.fileOps.edited.add(join(cwd, "src/b.ts"));
+			event.preparation.fileOps.edited.add("src/deleted.ts");
+			event.preparation.fileOps.edited.add("README.md");
+			const result = await fire(api, "session_before_compact", event, ctx) as {
+				compaction: { summary: string; details: { readFiles: string[]; modifiedFiles: string[] } };
+			};
+			return { root, cwd, ...result.compaction };
+		}
+
+		test("defaults to the full pi-style inventory", async () => {
+			for (const files of [undefined, "full"]) {
+				const { summary, details } = await compact(files);
+				expect(summary).toBe(
+					"## Goal\nKeep the test green.\n\n<read-files>\n" +
+					`${details.readFiles.join("\n")}\n</read-files>\n\n<modified-files>\n${details.modifiedFiles.join("\n")}\n</modified-files>`,
+				);
+				expect(details.readFiles.map((path) => path.split("/").at(-1))).toEqual(["notes.md", "missing.ts"]);
+				expect(details.modifiedFiles.map((path) => path.split("/").at(-1))).toEqual(["b.ts", "README.md", "a.ts", "deleted.ts"]);
+			}
+		});
+
+		test("compact lists only live files, with ~ and brace expansion", async () => {
+			const { summary, details, root, cwd } = await compact("compact");
+			expect(summary).toBe(
+				`## Goal\nKeep the test green.\n\n<read-files>\n~/notes.md\n</read-files>\n\n<modified-files>\n${cwd.replace(root, "~")}/{README.md,src/{a.ts,b.ts}}\n</modified-files>`,
+			);
+			expect(details.readFiles).toEqual([join(root, "notes.md")]);
+			expect(details.modifiedFiles).toEqual([join(cwd, "README.md"), join(cwd, "src/a.ts"), join(cwd, "src/b.ts")]);
+		});
+
+		test("none appends nothing but keeps the raw tracking in details", async () => {
+			const { summary, details } = await compact("none");
+			expect(summary).toBe("## Goal\nKeep the test green.");
+			expect(details.modifiedFiles).toHaveLength(4);
+			expect(details.readFiles).toHaveLength(2);
+		});
+
+		test.each(["brief", true, null, ""])("rejects invalid files=%j before requesting a summary", async (files) => {
+			await expect(compact(files)).rejects.toThrow('files must be "full", "compact", or "none"');
+		});
 	});
 });
